@@ -1,6 +1,7 @@
 # ---- 环境变量 / 密钥 ----
 .env
 .workbuddy/
+hello_agents_learn/memory_test_data/
 
 # ---- Python 缓存 ----
 __pycache__/
