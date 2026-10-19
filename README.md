@@ -11,7 +11,7 @@ hello_agents/
 ├── agentscope_learn/    # AgentScope v2：三国狼人杀多智能体游戏
 ├── camel_learn/         # CAMEL：角色扮演式双智能体协作写作
 ├── langgraph_learn/     # LangGraph：搜索问答工作流（状态图 + 检查点）
-├── docs/                # 学习笔记（空目录，占位）
+├── docs/                # 学习笔记（langchain-family/：三框架分析、资源、学习方案）
 ├── .env                 # LLM 配置，已在 .gitignore 中
 ├── .vscode/             # 解释器与调试配置
 └── README.md
@@ -155,4 +155,13 @@ python langgraph_learn/ask_answer.py
 - `autogen_learn/llms/llm_client.py:30` 的分支判断是死代码（`model_info` 恒为非空，后续分支不会执行）
 - 根目录 `__pycache__/` 中留有旧的扁平布局 pyc，可删除
 - `.gitignore` 只忽略 `.env` 与 `.workbuddy/`，建议补上 `.venv/` 与 `__pycache__/`
-- `docs/` 目录仍为空
+## 学习文档
+
+三框架（LangChain / LangGraph / DeepAgents）的分析与学习路线见 `docs/langchain-family/`：
+
+| 文档 | 内容 |
+| --- | --- |
+| `01-overview-analysis.md` | 三者定位与层次关系、DeepAgents 源码级架构（中间件栈 / DeltaChannel / recursion_limit）、选型决策表、官方对照实验 |
+| `02-resources-and-tutorials.md` | 官方文档 Map、源码必读入口、教程与课程、`.md` 直取文档的技巧、版本跟踪方法 |
+| `03-learning-plan.md` | 按本仓库现状定制的三阶段方案（读什么/写什么/验收/坑）、里程碑项目、时间与风险预算 |
+| `04-step-one-plan.md` | Day 1 可执行计划：环境检查、第一个 Agent 代码、三个破坏性实验、验收清单、排错表 |
