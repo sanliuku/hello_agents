@@ -120,13 +120,17 @@ class Neo4jGraphStore:
     
     def add_entity(self, entity_id: str, name: str, entity_type: str, properties: Dict[str, Any] = None) -> bool:
         """
-        添加实体节点
-        
+        添加实体节点（按 entity_id 幂等 upsert）
+
+        已存在同 id 节点时不会重复创建，且：
+        - created_at 只在首次创建时写入，命中时保留原值
+        - frequency 在命中时累加（传入值视为本次新增的频次增量，默认 1）
+
         Args:
             entity_id: 实体ID
             name: 实体名称
             entity_type: 实体类型
-            properties: 附加属性
+            properties: 附加属性（其中的 created_at/updated_at/frequency 由本方法接管）
         
         Returns:
             bool: 是否成功
@@ -134,27 +138,41 @@ class Neo4jGraphStore:
         if not self.available:
             return False
         try:
-            props = properties or {}
+            # 复制一份，避免原地修改调用方传入的字典
+            props = dict(properties or {})
+            now = datetime.now().isoformat()
+            # 时间戳/频次由本方法统一管理，防止被调用方覆盖
+            increment = props.pop("frequency", 1) or 1
+            props.pop("created_at", None)
+            props.pop("updated_at", None)
             props.update({
                 "id": entity_id,
                 "name": name,
                 "type": entity_type,
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat()
             })
             
             query = """
             MERGE (e:Entity {id: $entity_id})
-            SET e += $properties
+            ON CREATE SET e += $properties, e.created_at = $now,
+                          e.updated_at = $now, e.frequency = $increment
+            ON MATCH SET e += $properties, e.updated_at = $now,
+                         e.frequency = coalesce(e.frequency, 0) + $increment
             RETURN e
             """
             
             with self.driver.session(database=self.database) as session:
-                result = session.run(query, entity_id=entity_id, properties=props)
+                result = session.run(
+                    query,
+                    entity_id=entity_id,
+                    properties=props,
+                    now=now,
+                    increment=increment
+                )
                 record = result.single()
                 
                 if record:
-                    logger.debug(f"✅ 添加实体: {name} ({entity_type})")
+                    node = record["e"]
+                    logger.debug(f"✅ 添加实体: {name} ({entity_type}), 累计频次: {node.get('frequency')}")
                     return True
                 return False
                 

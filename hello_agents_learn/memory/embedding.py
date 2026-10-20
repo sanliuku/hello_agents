@@ -235,6 +235,9 @@ class OllamaEmbedding(EmbeddingModel):
                  dimension: Optional[int] = None, timeout: int = 60):
         self.model_name = model_name or "bge-m3"
         self.base_url = (base_url or os.getenv("EMBED_BASE_URL") or "http://localhost:11434").rstrip("/")
+        # 兼容 OpenAI 风格的 /v1 后缀（ollama 原生接口无此前缀）
+        if self.base_url.endswith("/v1"):
+            self.base_url = self.base_url[:-3]
         self.timeout = timeout
         if dimension is not None:
             self._dimension = int(dimension)

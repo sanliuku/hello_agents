@@ -9,6 +9,7 @@
 
 from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import datetime, timedelta
+import hashlib
 import json
 import logging
 import os
@@ -114,6 +115,10 @@ class SemanticMemory(BaseMemory):
         # 实体识别器
         self.nlp = None
         self._init_nlp()
+
+        # LLM 实体抽取器（懒加载，不可用时自动回退 spaCy）
+        self._llm = None
+        self._llm_init_failed = False
         
         # 记忆存储
         self.semantic_memories: List[MemoryItem] = []
@@ -583,65 +588,141 @@ class SemanticMemory(BaseMemory):
         chinese_ratio = chinese_chars / total_chars
         return "zh" if chinese_ratio > 0.3 else "en"
     
-    def _extract_entities(self, text: str) -> List[Entity]:
-        """智能多语言实体提取"""
-        entities = []
-        
-        # 检测文本语言
+    @staticmethod
+    def _stable_id(prefix: str, *parts: str) -> str:
+        """跨进程稳定的 ID（内置 hash 每个进程加盐，不能用于持久化主键）"""
+        key = "|".join(str(p) for p in parts)
+        return f"{prefix}_{hashlib.md5(key.encode('utf-8')).hexdigest()[:12]}"
+
+    def _get_llm(self):
+        """懒加载 LLM 客户端，失败后不再重试"""
+        if self._llm is None and not self._llm_init_failed:
+            try:
+                from hello_agents import HelloAgentsLLM
+                self._llm = HelloAgentsLLM(temperature=0.0)
+                logger.info("✅ LLM 实体抽取器就绪")
+            except Exception as e:
+                self._llm_init_failed = True
+                logger.warning(f"⚠️ LLM 实体抽取不可用，回退 spaCy: {e}")
+        return self._llm
+
+    def _select_nlp(self, text: str):
+        """按语言选择 spaCy 模型"""
         lang = self._detect_language(text)
-        
-        # 选择合适的spaCy模型
-        selected_nlp = None
         if lang == "zh" and "zh_core_web_sm" in self.nlp_models:
-            selected_nlp = self.nlp_models["zh_core_web_sm"]
-        elif lang == "en" and "en_core_web_sm" in self.nlp_models:
-            selected_nlp = self.nlp_models["en_core_web_sm"]
-        else:
-            # 使用默认模型
-            selected_nlp = self.nlp
-        
-        logger.debug(f"🌐 检测语言: {lang}, 使用模型: {selected_nlp.meta['name'] if selected_nlp else 'None'}")
-        
-        # 使用spaCy进行实体识别和词法分析
+            return self.nlp_models["zh_core_web_sm"]
+        if lang == "en" and "en_core_web_sm" in self.nlp_models:
+            return self.nlp_models["en_core_web_sm"]
+        return self.nlp
+
+    def _extract_entities(self, text: str) -> List[Entity]:
+        """实体提取：LLM 优先，spaCy 兜底
+
+        spaCy 小模型基于 OntoNotes 训练，对技术名词/短句召回很差
+        （如“Python是一种解释型、面向对象的编程语言”抽不到任何实体），
+        因此默认交给 LLM 抽取；LLM 不可用或无结果时再回退 spaCy。
+        """
+        # spaCy 仍用于词法分析（词元/依存关系入图）
+        doc = None
+        selected_nlp = self._select_nlp(text)
         if selected_nlp:
             try:
                 doc = selected_nlp(text)
-                logger.debug(f"📝 spaCy处理文本: '{text}' -> {len(doc.ents)} 个实体")
-                
-                # 存储词法分析结果，供Neo4j使用
                 self._store_linguistic_analysis(doc, text)
-                
-                if not doc.ents:
-                    # 如果没有实体，记录详细的词元信息
-                    logger.debug("🔍 未找到实体，词元分析:")
-                    for token in doc[:5]:  # 只显示前5个词元
-                        logger.debug(f"   '{token.text}' -> POS: {token.pos_}, TAG: {token.tag_}, ENT_IOB: {token.ent_iob_}")
-                
-                for ent in doc.ents:
-                    entity = Entity(
-                        entity_id=f"entity_{hash(ent.text)}",
-                        name=ent.text,
-                        entity_type=ent.label_,
-                        description=f"从文本中识别的{ent.label_}实体"
-                    )
-                    entities.append(entity)
-                    # 安全获取置信度信息
-                    confidence = "N/A"
-                    try:
-                        if hasattr(ent._, 'confidence'):
-                            confidence = getattr(ent._, 'confidence', 'N/A')
-                    except:
-                        confidence = "N/A"
-                    
-                    logger.debug(f"🏷️ spaCy识别实体: '{ent.text}' -> {ent.label_} (置信度: {confidence})")
-                
             except Exception as e:
-                logger.warning(f"⚠️ spaCy实体识别失败: {e}")
-                import traceback
-                logger.debug(f"详细错误: {traceback.format_exc()}")
-        else:
-            logger.warning("⚠️ 没有可用的spaCy模型进行实体识别")
-        
+                logger.warning(f"⚠️ spaCy 处理失败: {e}")
+
+        # 1) LLM 抽取
+        entities = self._extract_entities_llm(text)
+
+        # 2) spaCy 兜底
+        if not entities and doc is not None:
+            entities = self._entities_from_doc(doc)
+
+        if not entities:
+            logger.debug(f"� 未识别到实体: '{text}'")
+        return entities
+
+    _LLM_ENTITY_PROMPT = (
+        "你是信息抽取助手。从给定文本中抽取所有有意义的实体（人物、组织、地点、日期、"
+        "产品、技术/编程语言、概念等）。只输出 JSON 数组，不要输出任何解释或 markdown。"
+        '格式：[{"name": "实体名", "type": "类型"}]，type 取值：'
+        "PERSON, ORG, GPE, LOC, DATE, PRODUCT, TECH, CONCEPT, EVENT。"
+        "实体名保留原文写法，不要翻译或改写；没有实体时输出 []。"
+    )
+
+    def _extract_entities_llm(self, text: str) -> List[Entity]:
+        """用 LLM 做结构化实体抽取"""
+        llm = self._get_llm()
+        if llm is None:
+            return []
+
+        try:
+            raw = llm.invoke(
+                [
+                    {"role": "system", "content": self._LLM_ENTITY_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ LLM 实体抽取失败，回退 spaCy: {e}")
+            return []
+
+        entities: List[Entity] = []
+        seen: Set[Tuple[str, str]] = set()
+        for name, entity_type in self._parse_entity_json(raw):
+            if (name, entity_type) in seen:
+                continue
+            seen.add((name, entity_type))
+            entities.append(Entity(
+                entity_id=self._stable_id("entity", name, entity_type),
+                name=name,
+                entity_type=entity_type,
+                description=f"LLM从文本中识别的{entity_type}实体",
+            ))
+            logger.debug(f"🏷️ LLM识别实体: '{name}' -> {entity_type}")
+        return entities
+
+    @staticmethod
+    def _parse_entity_json(raw: str) -> List[Tuple[str, str]]:
+        """解析 LLM 返回的 JSON 数组，容忍代码围栏与前后废话"""
+        if not raw:
+            return []
+        start, end = raw.find("["), raw.rfind("]")
+        if start == -1 or end <= start:
+            return []
+        try:
+            data = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            logger.debug(f"⚠️ LLM 返回无法解析: {raw[:100]}")
+            return []
+        if not isinstance(data, list):
+            return []
+
+        results = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            entity_type = (str(item.get("type", "")).strip().upper() or "MISC")
+            results.append((name, entity_type))
+        return results
+
+    def _entities_from_doc(self, doc) -> List[Entity]:
+        """从 spaCy Doc 构造实体（兜底路径）"""
+        entities = []
+        logger.debug(f"📝 spaCy处理文本: {len(doc.ents)} 个实体")
+        for ent in doc.ents:
+            entities.append(Entity(
+                entity_id=self._stable_id("entity", ent.text, ent.label_),
+                name=ent.text,
+                entity_type=ent.label_,
+                description=f"从文本中识别的{ent.label_}实体",
+            ))
+            logger.debug(f"🏷️ spaCy识别实体: '{ent.text}' -> {ent.label_}")
         return entities
     
     def _store_linguistic_analysis(self, doc, text: str):
@@ -656,7 +737,7 @@ class SemanticMemory(BaseMemory):
                 if token.is_punct or token.is_space:
                     continue
                     
-                token_id = f"token_{hash(token.text + token.pos_)}"
+                token_id = self._stable_id("token", token.text, token.pos_)
                 
                 # 添加词元节点到Neo4j
                 self.graph_store.add_entity(
@@ -676,7 +757,7 @@ class SemanticMemory(BaseMemory):
                 
                 # 如果是名词，可能是潜在的概念
                 if token.pos_ in ["NOUN", "PROPN"]:
-                    concept_id = f"concept_{hash(token.text)}"
+                    concept_id = self._stable_id("concept", token.text)
                     self.graph_store.add_entity(
                         entity_id=concept_id,
                         name=token.text,
@@ -701,8 +782,8 @@ class SemanticMemory(BaseMemory):
                 if token.is_punct or token.is_space or token.head == token:
                     continue
                     
-                from_id = f"token_{hash(token.text + token.pos_)}"
-                to_id = f"token_{hash(token.head.text + token.head.pos_)}"
+                from_id = self._stable_id("token", token.text, token.pos_)
+                to_id = self._stable_id("token", token.head.text, token.head.pos_)
                 
                 # Neo4j不允许关系类型包含冒号，需要清理
                 relation_type = token.dep_.upper().replace(":", "_")
