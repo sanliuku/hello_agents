@@ -9,6 +9,9 @@
 ```powershell
 python langchain_learn/00_env_check.py
 python langchain_learn/01_graph_anatomy.py
+python langchain_learn/02_message_anatomy.py
+python langchain_learn/03_model_layer.py
+python langchain_learn/04_tool_layer.py
 ```
 
 原因：脚本方式下 `langchain_learn/` 会进 `sys.path[0]`，所以 `from _shared import ...` 可用；用 `-m` 反而会因模块名以数字开头而出问题。
@@ -20,6 +23,9 @@ python langchain_learn/01_graph_anatomy.py
 | `_shared.py` | 全书 | 读 `.env` 造模型 `get_model()`、打印消息轨迹 `dump_messages()` |
 | `00_env_check.py` | 第 0 章 | 环境自检：版本、入口、连通性、工具调用能力 |
 | `01_graph_anatomy.py` | 第 1 章 | 打印 `create_agent` 编出的图；对比"有工具/无工具" |
+| `02_message_anatomy.py` | 第 2 章 | 消息字段解剖；手工续写 4 条消息；流式 `tool_call_chunks` |
+| `03_model_layer.py` | 第 3 章 | 字符串解析 → 实例化分流；工具转 JSON；自写假模型跑通 6 层链路；缓存键对比（A–E 离线，F 真请求） |
+| `04_tool_layer.py` | 第 4 章 | `@tool` 四种写法、三份 schema、注入参数、三种失败、content/artifact |
 
 ## 这些是参考实现
 

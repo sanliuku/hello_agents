@@ -275,13 +275,39 @@ tool_calls : [{'name': 'ping', 'args': {'text': 'hello'}, 'id': 'call_...', 'typ
 2. 你的 `.env` 里 `LLM_MODEL_ID` 写的是 `gpt-4o-mini`，但 `LLM_BASE_URL` 指向国内某厂商端点，会发生什么？为什么？
 3. 自检脚本第 5 步为什么要单独测 `bind_tools`？它和第 4 步的"能对话"差别在哪？
 
-<details>
-<summary>答案（先自己想，再展开）</summary>
+### 参考答案
 
-1. 因为 `langchain` v1 的 `create_agent` 是用 LangGraph 的 `StateGraph`/`ToolNode` 实现的，`langgraph` 是它的**运行时依赖**，pip 会连带安装。这也是"LangChain 搭在 LangGraph 之上"的物理证据。
-2. 能对话（如果该厂商恰好也有同名字符串映射），但很可能 `model not found`，因为 `model` 只是请求体参数，由**端点**决定接受哪些名字。三者（key / base_url / model）必须属于同一家服务。
-3. 第 4 步测的是"文本对话通路"，第 5 步测的是"模型会不会按 schema 输出 tool_calls"。很多国内模型/代理端点支持前者不支持后者；不支持的话，`create_agent` 里模型永远不会调工具，你会误以为是代码写错了。
-</details>
+> 先自己做，再对答案。每条后面的 **延伸** 是超出题面的部分，用来连到后面的章。
+
+**1. `pip install langchain` 之后，`langgraph` 为什么也出现在 `pip list` 里？**
+
+因为 `langchain` v1 的 `create_agent` 就是拿 LangGraph 的 `StateGraph` / `ToolNode` 搭出来的，`langgraph` 是它的**运行时依赖**，pip 会连带安装。这是"LangChain 搭在 LangGraph 之上"的**物理证据**，不是宣传语。
+
+自己验证：`pip show langgraph` 看 `Required-by`；或直接打开 `python -c "import langchain.agents.factory as f; print(f.__file__)"` 那个文件，读头部的 import 段——第 1 章会把里面的 `graph.add_node` / `add_edge` 逐行讲。
+
+> **延伸**：所以"我只想用 LangChain、不想学 LangGraph"是伪命题。图在你脚下，你迟早要看它。
+
+**2. `.env` 里 `LLM_MODEL_ID=gpt-4o-mini`，但 `LLM_BASE_URL` 指向国内某厂商端点，会发生什么？**
+
+三种可能，取决于那个端点：
+
+| 结果 | 原因 |
+|---|---|
+| 能跑，但模型不是你以為的那个 | 该端点把 `gpt-4o-mini` 当**别名**映射到自家模型（能力和价格都变了） |
+| `400 model not found` | 端点不认这个名字 |
+| 能聊天、但工具永不触发 | 端点接受请求但**忽略 `tools` 字段**，永远返回纯文本 |
+
+`model` 只是**请求体里的一个字符串参数**，认不认它由**端点**决定。所以 `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL_ID` 三者必须属于同一家服务。
+
+> **延伸**：不要靠猜，靠自检脚本第 5 步实测。第三行那种失败是最阴的——它不报错。
+
+**3. 自检脚本第 5 步为什么要单独测 `bind_tools`？它和第 4 步"能对话"差别在哪？**
+
+第 4 步测的是**文本通路**（请求进去、文本出来）；第 5 步测的是**函数调用通路**（请求里多了 `tools` schema、响应里多了 `tool_calls` 结构）。两条通路在协议上是不同的能力，很多国内模型和代理端点**只支持前者**。
+
+不支持时的表现：`create_agent` 里模型永远不调工具，你不报错、不抛异常，只是"它怎么不查天气"。新手会 100% 误判成自己代码写错。
+
+> **延伸**：这也是本教材每章都先 `dump` `tool_calls` 的原因——它是判断"链路是否健全"最便宜的信号，比读日志快。
 
 ---
 

@@ -1,10 +1,10 @@
 {
-    "python.defaultInterpreterPath": "D:/tools/miniforge/python.exe",
+    "python.defaultInterpreterPath": "F:\\wbb_project\\github_lib\\hello_agents\\.venv\\Scripts\\python.exe",
     "python-envs.pythonProjects": [
         {
             "path": ".",
-            "envManager": "ms-python.python:conda",
-            "packageManager": "ms-python.python:conda"
+            "envManager": "ms-python.python:venv",
+            "packageManager": "ms-python.python:pip"
         }
     ]
 }
