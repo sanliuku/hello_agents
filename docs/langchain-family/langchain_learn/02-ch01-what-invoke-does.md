@@ -17,7 +17,7 @@
 
 文件：`libs/langchain_v1/langchain/agents/factory.py`
 
-### 2.1 先看签名——16 个参数，只有 2 个是位置参数
+### 2.1 签名与十六个参数
 
 ```python
 def create_agent(
@@ -51,6 +51,38 @@ def create_agent(
 > "If `None` or an empty list, the agent will consist of **a model node without a tool calling loop**."
 
 **这句话是本章的钥匙**——没有工具就没有循环。稍后实验 A 会验证。
+
+#### 十六个参数逐个说清
+
+先给一个能省掉你一半困惑的划分：**16 个参数里只有 7 个真正参与"建图"**（`model`、`tools`、`system_prompt`、`middleware`、`response_format`、`state_schema`、`context_schema`），其余 8 个是**一次性透传给 `graph.compile()`** 的运行配置。`name` 特殊，两边都沾。所以"改图的结构"和"改图的运行配置"是两件事。
+
+下表引用的代码片段来自 master 分支 `libs/langchain_v1/langchain/agents/factory.py` 里 `create_agent` 的实现体（docstring 之后那一段）。行号会随版本漂移，所以我引片段、不引行号；你按片段去搜一定能搜到。
+
+| 参数 | 默认 | 源码里它到底做了什么 | 你什么时候需要它 |
+|---|---|---|---|
+| `model` | 无（必填，位置参） | `if isinstance(model, str): model = init_chat_model(model)`。**这里不做任何 `bind_tools`**——工具是每次调用时才在 `_get_bound_model(request)` 里绑上去的 | 永远要。**坑**：传字符串时 api_key/base_url 只能靠 `init_chat_model` 认识的环境变量；你 `.env` 里的 `LLM_*` 它不认识，所以本书一律传 `BaseChatModel` 实例 |
+| `tools` | `None` | `None → []`；按 `isinstance(t, dict)` 拆成 `built_in_tools`（交给 provider 执行，不在本地跑）和 `regular_tools`；`available_tools = middleware_tools + regular_tools`，有它才建 `ToolNode`；最后 `default_tools = list(tool_node.tools_by_name.values()) + built_in_tools` | 想让模型能动手。传 `dict` 就是"服务端工具"，它**不会**出现在本地 `ToolNode` 里 |
+| `system_prompt` | `None` | 统一转成 `SystemMessage`（变量名 `system_message`）。**它不进 state**——每次调用临时拼 `messages = [request.system_message, *messages]` | 想要稳定人设。想在运行时改它，用 middleware 的 `wrap_model_call` 改 `request.system_message` |
+| `middleware` | `()` | 干四件事：`m.tools` 并入 ToolNode；**只为覆写了钩子的** middleware 建节点（名字形如 `f"{m.name}.before_model"`）；`wrap_*` 钩子被 `_chain_model_call_handlers` 链成一个 handler；`m.state_schema` 参与 state 合并。实例重名直接 `raise AssertionError("Please remove duplicate middleware instances.")` | 想插钩子。第 8 章细讲 |
+| `response_format` | `None` | 原始 schema 被包成 `AutoStrategy`；建图时**先用 `ToolStrategy` 预生成** `structured_output_tools`（这些工具**不进** `default_tools`）；真正用哪种策略由 `_get_bound_model` 看模型能力在调用时决定 | 想要 `result["structured_response"]` |
+| `state_schema` | `None` → `AgentState` | `state_schemas = [*(m.state_schema for m in middleware), base_state]`——**你自己的排最后，所以冲突时你赢**；再经 `_resolve_schemas` 拆成 (state, input, output) 三个动态 TypedDict | 想往 state 里加字段 |
+| `context_schema` | `None` | 原样传给 `StateGraph(..., context_schema=context_schema)` | 想传"不进消息、不落盘"的运行时依赖：用户 id、db 连接、租户配置 |
+| `checkpointer` | `None` | 透传 `graph.compile()` | 多轮记忆 / 中断续跑 / HITL |
+| `store` | `None` | 透传 compile | 跨 thread 的长期记忆 |
+| `interrupt_before` | `None` | 透传 compile，值是**节点名**列表 | 编译期钉死的静态断点 |
+| `interrupt_after` | `None` | 透传 compile | 同上，节点跑完之后停 |
+| `debug` | `False` | 透传 compile | 想看每一步 channel 变化 |
+| `name` | `None` | **三处**消费：`graph.compile(name=name)`；`config["metadata"]["lc_agent_name"] = name`；执行时 `if name: output.name = name` | 多 agent 协作时区分"谁在说话" |
+| `cache` | `None` | 透传 compile | 节点级缓存，同输入不重复调模型 |
+| `transformers` | `None` | 实际登记的是 `_dedupe_transformers([ToolCallTransformer, SubagentTransformer, *middleware_transformers, *(transformers or ())])`，再去 compile | 本章不用；属于内部调用/流式管线 |
+
+#### 三个容易看错的地方
+
+1. **`tools` 里的 `dict` 不是笔误。** `tools=[my_func, {"type": "web_search"}]` 完全合法：前者进 `ToolNode` 本地跑，后者进 `built_in_tools` 交给 provider。这也解释了 `default_tools` 为什么要 `+ built_in_tools`——不加，模型根本看不到服务端工具。
+2. **`system_prompt` 为什么不在 `result["messages"]` 里**——依据就是那行 `messages = [request.system_message, *messages]`：它是"每次临时加在最前面"，不是存进 state 的第一条。第 1 章我提醒过一次，这里终于有源码依据了。
+3. **`recursion_limit` 不是参数。** 它是函数末尾硬编码的：`config: RunnableConfig = {"recursion_limit": 9_999}`，然后 `graph.compile(...).with_config(config)`。所以实验 C 必须自己 `invoke(..., config={"recursion_limit": 2})` 去覆盖——**你没法通过 `create_agent(...)` 把它传进去**。
+
+这七个"建图参数"里，`middleware`（第 8 章）、`response_format`（第 9 章）、`checkpointer`（第 10 章）会各占一章；剩下那些你真用到时回来查这张表就够了。
 
 ### 2.2 建节点
 

@@ -60,7 +60,7 @@
 | **2** | Message 解剖 | `langchain_core/messages/` | `/oss/python/langchain/messages` | ☑ |
 | **3** | Model 层 | `chat_models/init_chat_model.py` | `/oss/python/langchain/models` | ☑ |
 | **4** | Tool 层 | `langchain_core/tools/` | `/oss/python/langchain/tools` | ☑ |
-| **5** | State 与 Reducer | `agents/middleware/types.py` 的 `AgentState` | `/oss/python/langchain/short-term-memory` | ☐ |
+| **5** | State 与 Reducer | `agents/middleware/types.py` 的 `AgentState` + `factory.py:_resolve_schemas` | `/oss/python/langchain/short-term-memory` | ☑ |
 | **6** | 会话持久化 | `create_agent(checkpointer=...)` | `/oss/python/langchain/short-term-memory` | ☐ |
 | **7** | 结构化输出 | `agents/structured_output.py` | `/oss/python/langchain/structured-output` | ☐ |
 | **8** | Middleware 上：钩子地图 | `agents/middleware/types.py` + factory 节点装配 | `/oss/python/langchain/middleware/overview` | ☐ |
@@ -158,7 +158,7 @@ Part II 的章节多一段：
 | I | 2 Message 解剖 | ☑ | | |
 | I | 3 Model 层 | ☑ | | |
 | I | 4 Tool 层 | ☑ | | |
-| I | 5 State 与 Reducer | ☐ | | |
+| I | 5 State 与 Reducer | ☑ | 2026-10-22 | 3 |
 | I | 6 会话持久化 | ☐ | | |
 | I | 7 结构化输出 | ☐ | | |
 | I | 8 Middleware 钩子地图 | ☐ | | |
@@ -185,7 +185,7 @@ Part II 的章节多一段：
 ## 九、本教材的诚实边界
 
 - 源码引用基于 `master` 分支的 `libs/langchain_v1`（v1 线）。你本地装的若是 v0.x，文件名与内部结构会不同（见第 0 章的版本判定法）。
-- 我**没有在你的机器上实机运行**过这些代码（本机 pwsh 执行被沙箱拦住），所以每章的"你应该看到"是按源码逻辑推导的期望值。第一次跑若有差异，优先怀疑版本，再怀疑我。
+- **ch00–ch04 的"你应该看到"是按源码逻辑推导的**（写作时本机没有可用的执行通道）。**ch05 起改为实测**：第 5 章全部输出都是在本机 `langchain 1.4.6 / core 1.6.12 / langgraph 1.2.16` + `qwen3:latest@ollama` 上跑出来的；第 3 章的 callbacks 补充小节也已补实测（`langchain_learn/03_callbacks_demo.py`、`03_callback_params_trace.py`）。凡标"未实测"的地方，都明确写了是读源码推的。
 - 模型名会漂移。凡是出现具体模型名的地方，一律以你 `.env` 的 `LLM_MODEL_ID` 为准。
 - **官方锚点会漂移。** `docs.langchain.com` 的页路径调整过多次（例如 `langchain-mcp-adapters` 已并入内置 `langchain.mcp`，middleware 从单页拆成 `/middleware/` 目录）。若某条路径 404，回到 `https://docs.langchain.com/llms.txt` 找新位置——那是官网自己给的机器可读索引，比站内搜索可靠。
 - **Part II 有几章本机可能跑不全**：MCP 的远程 server、部署、前端 streaming 都会碰到网络或需要额外服务。遇到环境阻塞不算你的问题，把该章降级为"读懂 + 画出调用链"。

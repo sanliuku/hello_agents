@@ -179,6 +179,33 @@ def _model(self, config: RunnableConfig | None = None) -> Runnable[Any, Any]:
 
 **接收外部传入的 config 时，永远枚举 `configurable_fields=(...)`，不要用 `"any"`。**
 
+#### 可配置模型到底什么时候用
+
+先把两件事分开，因为提问里最容易把它们混成一件：
+
+| 你想做的事 | 该用的机制 |
+|---|---|
+| 下一次 `invoke` 换一个 provider / key / base_url | `configurable_fields` + config |
+| agent 循环**内部**第 3 步和第 5 步用不同模型 | middleware 的 `wrap_model_call` 改 `request.model` |
+| 只是自己换个模型跑跑 | 什么机制都不用，重新 `get_model(...)` 再传进 `create_agent` |
+
+**"每轮对话后切 config"这个说法只对一半。** config 不是"对话结束后写进去"的状态，它是**每次 `invoke` 的入参**，沿 Runnable 树往下传。一次 `agent.invoke(..., config=A)` 内部可能跑 5 轮 model→tools→model，这 5 轮共享**同一个** A。你把 A 换成 B，影响的是**下一次 `invoke`**，不是这一次的第 5 轮。
+
+真正让"循环内部每步换模型"成立的是另一条路：`create_agent` 的 model 节点每次执行都走 `_get_bound_model(request)`，而 middleware 的 `wrap_model_call` 能改 `request.model`。那条路完全不需要 `configurable_fields`。
+
+**它的真实主场，按使用频率排：**
+
+1. **同一个图，不同租户/用户用不同 key 或 base_url。** config 由外层（HTTP 请求头、DB 里的用户配置）注入，图本身一行不改。这是唯一非它不可的场景——你没法让一张已经 `compile()` 好的图去读请求上下文。
+2. **dev / CI / 生产靠 config 切 provider。** 代码零改动，只在部署配置里换 `model` 字段。
+3. **工厂函数不让模型在编译期锁死。** `create_agent(model=init_chat_model())` 这种写法，运行时才定模型。
+4. **多智能体里给不同角色不同模型。** 靠 `config_prefix` 拆成 `primary_model` / `critic_model` 两组 key。
+
+**代价要算清**：`_model()` 无缓存，每次 `invoke` 重建一次客户端。放进 agent 循环，就是一次对话重建 N 次（N = model 节点被进入的次数）。所以第 3 条"工厂不锁死"听着优雅，代价是每次调用都多一次 `importlib` 查找加对象构造。
+
+**什么时候不该用它**：如果模型在你进程生命周期里是固定的，直接构造好 `ChatOpenAI(...)` 传进去。可配置模型解决的是"**谁**来决定用哪个模型"这个权限问题，不是"**怎么**换模型"这个技术问题——后者有更便宜的解。
+
+> 上面 4 个场景与"每轮重建"的代价，是**从源码推的**（`_ConfigurableModel._model` 无缓存 + `_init_chat_model_helper` 每次构造），没有实测计时。第一个场景（多租户注入 config）也没有在本机跑通，因为 `pwsh` 被沙箱 ACL 挡住。
+
 ### 2.5 `BaseChatModel` 把方法分成两张表
 
 类文档串里就有这张对照表，直接抄下来当心智模型：
@@ -231,6 +258,158 @@ if isinstance(model_input, str):          return StringPromptValue(text=model_in
 if isinstance(model_input, Sequence):     return ChatPromptValue(messages=convert_to_messages(model_input))
 raise ValueError(...)
 ```
+
+#### callbacks：不是"钩子开关"，是旁路观察通道
+
+先把因果说正：**你不是用 `callbacks` 去"设置" `on_chat_model_start`**。这两个事件的位置是框架在 `generate()` 里写死的，你提供的是"事件发生时该通知谁"。
+
+```python
+def generate(self, messages, stop=None, callbacks=None, *, tags=None, metadata=None, run_name=None, **kwargs) -> LLMResult:
+    params = self._get_invocation_params(stop=stop, **kwargs)
+    callback_manager = CallbackManager.configure(
+        callbacks, self.callbacks, self.verbose,   # 继承来的 / 本地默认 / verbose
+        tags, self.tags,                            # 继承 tags / 本地 tags
+        metadata, self.metadata,                    # 继承 metadata / 本地 metadata
+    )
+    run_managers = callback_manager.on_chat_model_start(   # ← 触发点 1
+        {**self._identifying_params},
+        messages,
+        invocation_params=params,        # ← 本次实际要发的参数（model/temperature/stop…）
+        options={"stop": stop},
+    )
+    results = [
+        self._generate_with_cache(m, stop=stop, run_manager=run_managers[i] if run_managers else None, **kwargs)
+        for i, m in enumerate(messages)
+    ]
+    output = LLMResult(
+        generations=[r.generations for r in results],
+        llm_output=self._combine_llm_outputs([r.llm_output for r in results]),
+    )
+    for run_manager in run_managers:
+        run_manager.on_llm_end(output)                         # ← 触发点 2
+    return output
+```
+
+`run_managers` 是 **list**，因为 `messages` 是 `list[list[BaseMessage]]`：`invoke` 只塞一条，`batch` 塞 N 条，每条 prompt 一个独立 run。这也解释了为什么调试 batch 时你会看到 N 组 start/end。
+
+**chat model 这一层只有 4 个事件：**
+
+| 事件 | 谁触发 | 你能拿到什么 |
+|---|---|---|
+| `on_chat_model_start` | `generate()` 开头 | `messages` 全量 + `invocation_params`（真正要发出去的参数）|
+| `on_llm_new_token` | `_stream` / `_astream` 每吐一个 chunk | 增量 token（非流式调用时根本不触发）|
+| `on_llm_end` | `generate()` 末尾 | `LLMResult`（含 token usage）|
+| `on_llm_error` | 异常路径 | 异常对象 |
+
+再往上一层还有 `on_chain_start/end/error`、`on_tool_start/end/error`、`on_retriever_*`、`on_retry`。`astream_events` 不是新东西，它就是把这些回调翻译成统一事件流的消费者。
+
+**四个注入途径**（`CallbackManager.configure` 会合并；注意「合并」在 handler / tags / metadata 上规则**各不相同**，见下面的实测表）：
+
+```python
+model.invoke(msgs, config={"callbacks": [my_handler]})   # ① 最常用：只影响这一次调用及其子树
+ChatOpenAI(..., callbacks=[my_handler])                  # ② 构造期默认 handler
+ChatOpenAI(..., verbose=True)                            # ③ 装一个打印到 stdout 的 debug handler
+model.with_config(callbacks=[my_handler])                # ④ 绑在 Runnable 上，跟着它走
+```
+
+**三个容易看错的地方：**
+
+1. **start/end 的条数 ≠ HTTP 请求数。** 这两个触发点在 `generate()` 里，不在 `_generate_with_cache` 里。所以缓存命中时你照样收到 start + end，而 `on_llm_new_token` 一条都没有。
+2. **`_generate` 签名里没有 `run_manager`，就永远收不到 token 事件。** 基类用 `_signature_parameters(self._generate).get("run_manager")` 判断（就是 2.7 关卡 3 那一行），没有就当你不支持回调，静默不传。这是自定义 provider "流式不生效"最常见的原因。
+3. **handler 里抛异常默认不会中断模型调用。** `BaseCallbackHandler.raise_error` 默认 `False`，事件分发时捕获并记日志；想让它抛，得在 handler 类上写 `raise_error = True`。
+
+#### 实跑记录：上面四条落成数字
+
+环境：`langchain 1.4.6` / `langchain-core 1.6.12` / `langchain-openai 1.7.2`，模型 `qwen3:latest`（本地 ollama，`base_url=http://localhost:11434/v1`）。
+对应代码：`langchain_learn/03_callbacks_demo.py`（A/A2/B 段零 token）与 `langchain_learn/03_callback_params_trace.py`（B–F 段）。
+
+**① `configure` 的合并规则，三种字段三种行为**（`03_callbacks_demo.py` B 段）：
+
+```python
+cm = CallbackManager.configure(
+    inheritable_callbacks=[TraceHandler()], local_callbacks=[TraceHandler()],
+    inheritable_tags=["from-config"],       local_tags=["from-self"],
+    inheritable_metadata={"layer": "config"}, local_metadata={"layer": "self"},
+)
+```
+
+实测：`handlers 数量 = 2`（**拼接，不去重**）｜`tags = ['from-config', 'from-self']`（**拼接**）｜`metadata = {'layer': 'self'}`（**字典覆盖，本地赢**）。
+
+一句话记住：**handler 和 tags 做加法，metadata 做覆盖。** 这条差异有实际后果——你往上挂 `{"user_id": ...}`，里层同名键会把外层悄悄盖掉；tags 则永远不会被吃掉，所以"给某次请求打标"用 tags 比用 metadata 可靠。
+
+**② 构造函数里的 callbacks 不会自动变成"可继承"**（A 段）：
+
+```text
+configure(inheritable_callbacks=None, local_callbacks=[TraceHandler()])
+  handlers            = ['TraceHandler']
+  inheritable_handlers= []          # ← 注意这里
+```
+
+`handlers` 是"这次通知谁"，`inheritable_handlers` 是"往下传谁"。只从 `local_callbacks` 进来的 handler 进 `handlers` 但**不进** `inheritable_handlers`——真正沿 tree 下钻的继承是 `Runnable.with_config` / `config` 那条链在做，不是构造函数。所以"为什么我 `ChatOpenAI(callbacks=[h])` 收不到 agent 里 tool 的事件"的答案是：它本来就不负责那个。
+
+**③ `run_id.hex[:8]` 不是唯一标识——别拿它当 id 用**（A2 段，一次 batch 两条 prompt）：
+
+```text
+run_manager[0].run_id = 01a1619c-d56d-7c10-a353-fa4968d7391a
+run_manager[1].run_id = 01a1619c-d56d-7c10-a353-fa56fdbe5abc
+                         ^^^^^^^^ 前 8 位一模一样
+```
+
+langsmith 的 `run_id` 是 **UUIDv7**（时间戳在前），同一毫秒内产生的两个 run 前缀相同。日志里只截 8 位，会把两次不同调用打成同一个 id——排障时尤其致命。要截就截**尾部** 8 位，或者干脆打全。
+
+**④ temperature 的三处写法，谁盖谁（实测 `invocation_params` 里的值）**
+
+| 写法 | 实测 `temperature` | 结论 |
+|---|---|---|
+| `ChatOpenAI(temperature=0.0)` + `invoke(...)` | `0.0` | 构造值作为默认 |
+| `ChatOpenAI(temperature=0.0)` + `invoke(..., temperature=0.9)` | `0.9` | **调用期 kwargs 赢** |
+| `ChatOpenAI(temperature=0.0).bind(temperature=0.7)` + `invoke(...)` | `0.7` | **bind 赢构造，但输给调用期 kwargs** |
+
+优先级：**`invoke` 的 kwargs > `bind` 的预置 > 构造参数**。
+
+**⑤ 真发出去的 payload 里，没有 callbacks / tags / metadata**（D 段，靠覆写 `_get_request_payload` 偷看）：
+
+```text
+[wire payload] {'model': 'qwen3:latest', 'stream': False, 'temperature': 0.9, 'max_completion_tokens': 32}
+[payload 里有 callbacks 吗] False
+```
+
+两个顺带的细节：`invoke(max_tokens=32)` 在请求体里叫 **`max_completion_tokens`**（langchain-openai 按新 OpenAI 规范改名，老字段 `max_tokens` 你写、它转）；`meta_keys` 里那堆 `ls_provider` / `ls_model_name` / `lc_versions` 不是你传的，是 langchain 自己注入的 tracing 元数据。
+
+**⑥ 流式下的两个"意外"**（`03_callbacks_demo.py` C3 段）
+
+```text
+[token] ''   × 31     ← qwen3 的思考段，content 为空，但事件照样发
+[token] '一' [token] '、' [token] '二' ...
+[end] usage=None      ← 流式结束拿不到 usage_metadata
+```
+
+同一份 handler，非流式 `invoke` 的 `on_llm_end` 能拿到完整 `{'input_tokens':15,'output_tokens':433,'total_tokens':448}`，流式却是 `None`——因为 `stream_usage` 默认不开。想流式也要 usage，构造模型时加 `stream_usage=True`。
+
+而前面那 31 个空 token 是**思维链阶段**：模型在 reasoning 字段里吐字，`content` 还是空的。做打字机效果时这些空 token 会让前端"先卡住 30 帧"，得靠 `additional_kwargs` 里的 reasoning 字段分流。
+
+**⑦ 进了 agent，事件流长这样**（`03_callback_params_trace.py` E 段，一次"北京天气"问答，共 10 条事件）
+
+```text
+chain_start   name=LangGraph  root=True   tags=['agent-demo']
+chain_start   name=model      root=False  tags=['graph:step:1','agent-demo']
+chat_model_start  msgs_per_prompt=[1]  meta_keys=[..., 'langgraph_node', 'langgraph_step', 'langgraph_triggers', 'langgraph_path', 'checkpoint_ns']
+llm_end
+chain_start   name=tools      root=False  tags=['graph:step:2','agent-demo']
+tool_start    name=get_weather  input_str={'city': '北京'}   parent_is_node=True
+tool_end      output=content='北京：晴，26℃' ...
+chain_start   name=model      root=False  tags=['graph:step:3','agent-demo']
+chat_model_start  msgs_per_prompt=[3]     ← 第二轮带上了 AI 的 tool_calls + ToolMessage
+llm_end
+```
+
+三个能直接拿去排障的点：
+
+1. **节点名就是 `chain_start.name`**：`LangGraph`（整图）→ `model` → `tools` → `model`。你在 LangSmith 里看到的那些框，就是这三个。
+2. **`langgraph_step` / `langgraph_node` 在 metadata 里**——想知道"这次模型调用是第几步、哪个节点发的"，不用猜，metadata 直接给。
+3. **`tool_start` 的 `input_str` 是 dict，不是 JSON 字符串**。基类签名写的是 `input_str: str`，但 v1 的 `ToolNode` 直接把参数字典传进来了。你要打日志就得自己 `json.dumps`，别指望它已经是字符串——按类型标注去写 `input_str[:60]` 会抛 `TypeError`。
+
+**⑧ `raise_error` 的默认值**：`langchain_core/callbacks/base.py` 里 `BaseCallbackHandler.raise_error = False`。这条是**读源码得到的，没有实测**——验证它正好是本章的破坏实验：把某个 handler 方法里加一句 `1/0`，跑一次 `invoke`，模型照常返回；再把类属性改成 `raise_error = True`，同一个 `1/0` 会把 `ZeroDivisionError` 抛到你的调用栈上。两步都做完，你就再也不会搞混"回调出错"和"模型出错"。
 
 ### 2.7 `_generate_with_cache`：五个关卡，顺序不能乱
 
