@@ -16,6 +16,7 @@ python langchain_learn/03_callback_params_trace.py
 python langchain_learn/04_tool_layer.py
 python langchain_learn/05_state_reducer.py
 python langchain_learn/06_checkpointer.py
+python langchain_learn/06_lite_checkpoint.py
 ```
 
 原因：脚本方式下 `langchain_learn/` 会进 `sys.path[0]`，所以 `from _shared import ...` 可用；用 `-m` 反而会因模块名以数字开头而出问题。
@@ -53,6 +54,7 @@ python langchain_learn/00_official_agent_equation.py --real
 | `04_tool_layer.py` | 第 4 章 | `@tool` 四种写法、三份 schema、注入参数、三种失败、content/artifact |
 | `05_state_reducer.py` | 第 5 章 | `AgentState` 注解、`add_messages` 五种情况、一 state 变三份 schema、有/无 reducer 对比、假模型抓"失忆"铁证、自定义 reducer（A–F 零 token，`--real` 联网） |
 | `06_checkpointer.py` | 第 6 章 | 拆 `InMemorySaver` 三个字典（`storage`/`writes`/`blobs`）；`channel_values` 为什么是空的；uuid6 与 `max()` 取最新；`get_state_history` 时间轴；`update_state` 分叉；**自定义"会喊的 reducer"证明恢复时不重放**（A–G 零 token、纯图无 LLM，`--real` 才跑 `create_agent`） |
+| `06_lite_checkpoint.py` | 第 6 章 · 极简版 | 114 行、只用标准库重写一遍存档：`CheckpointStore` 的 `save/load/head/history`、`(thread, 变量, 版本)` 二级键、值没变就复用旧版本。跑一次能看到 `8 帧 / 6 份内容`、以及改档长出新分支（标识符全英文，注释中文） |
 | `_official_common.py` | 附录 | 7 个官方对照示例共用：分节横幅、`--real` 判定、长对象截断 |
 | `00_official_agent_equation.py` | 第 0 章附录 | overview 页命题 `Agent = Model + Harness`；`provider:model` 怎么拆（`ollama:qwen3:latest` 的冒号坑）；15 个参数分 harness / 运行时两堆；三框架判据 + 本机装了什么 |
 | `01_official_create_agent.py` | 第 1 章附录 | 五层配置逐层建图对比（节点 vs 边）；`response_format` 改边不改节点；retry / PII / HITL 三种 middleware 对图的影响（PII 会加 2 个节点） |

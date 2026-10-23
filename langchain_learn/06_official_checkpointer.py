@@ -308,7 +308,7 @@ print("    SqliteSaver           本地文件，开发期最省事：pip install
 print("    PostgresSaver         生产默认：langgraph-checkpoint-postgres + psycopg[binary]，记得 setup() 建表")
 print("    Async* 版本            FastAPI 之类的异步栈里用，别在 async 里调同步 saver")
 
-print("\n  官方 Troubleshooting 里那三个坑（都是线上真会遇到的）：")
+print("\n  官方 Troubleshooting 里那四条坑（都是线上真会遇到的）：")
 print("    · thread_id 超过 255 字符 → Postgres 直接报错。用 uuid7/hash，别拼长字符串")
 print("    · MemorySaver 不跨进程 → 你在 A 进程存、B 进程读，永远读不到（不是代码 bug）")
 print("    · checkpoint 无限增长 → 每轮都新增几张，长期跑要给保留策略（定期删旧 thread/旧 checkpoint）")

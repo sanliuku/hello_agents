@@ -570,3 +570,28 @@ exit   1 张   [step1/loop]
 ### 认知修正
 
 > 我原本以为"持久化"就是把 state 存成 JSON、下次读回来；实际上它是**三层主键 + 三张表 + 一套版本号**：主行只存指针，值按 `(channel, version)` 去重，`writes` 单独存节点级中间结果，恢复靠 `from_checkpoint` 直接赋值而不是重算。**弄清楚这一层，你才能解释"为什么它记得、为什么它丢了、为什么重放会重复扣款"这三件看起来无关的事。**
+
+## 附 · 114 行复刻版
+
+`langchain_learn/06_lite_checkpoint.py` 不依赖 langgraph，只用标准库把上面这套机制写了一遍（标识符全英文，注释中文），四个方法对应四件事：
+
+| 方法 | 一句话 |
+|---|---|
+| `save` | 存一帧：`step` / `next` / 父档 / 版本表；值没变就复用旧版本 |
+| `head` | 取这个 `thread` 最新的一帧 |
+| `load` | 照版本表把值捞回来（直接读，不重放 reducer） |
+| `history` | 从新到旧列一遍 |
+
+两轮对话的输出，正好复现了真 saver 的形状：
+
+```
+c01  step=-1  next=model   版本表={'messages': 1}
+c02  step= 0  next=model   版本表={'messages': 1}   ← 值没变，复用 v1
+c03  step= 1  next=tools   版本表={'messages': 2}
+c04  step= 2  next=model   版本表={'messages': 3}
+c05  step= 3  next=None    版本表={'messages': 4}
+
+快照 8 张，messages 只存了 6 份
+```
+
+两个结论一眼可见：**帧数 > 内容份数**（帧是时序，内容是值）；**改一帧不会动原帧**（`load` 出来的是深拷贝，`save` 时新版本号另起）。
