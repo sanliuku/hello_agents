@@ -61,7 +61,7 @@
 | **3** | Model 层 | `chat_models/init_chat_model.py` | `/oss/python/langchain/models` | ☑ |
 | **4** | Tool 层 | `langchain_core/tools/` | `/oss/python/langchain/tools` | ☑ |
 | **5** | State 与 Reducer | `agents/middleware/types.py` 的 `AgentState` + `factory.py:_resolve_schemas` | `/oss/python/langchain/short-term-memory` | ☑ |
-| **6** | 会话持久化 | `create_agent(checkpointer=...)` | `/oss/python/langchain/short-term-memory` | ☐ |
+| **6** | 会话持久化 | `langgraph/checkpoint/` + `channels/{base,binop}.py` | `/oss/python/langchain/short-term-memory`、`/oss/python/langgraph/checkpointers` | ☑ |
 | **7** | 结构化输出 | `agents/structured_output.py` | `/oss/python/langchain/structured-output` | ☐ |
 | **8** | Middleware 上：钩子地图 | `agents/middleware/types.py` + factory 节点装配 | `/oss/python/langchain/middleware/overview` | ☐ |
 | **9** | Middleware 下：写有用的 | 同上 + `HumanInTheLoop` | `/oss/python/langchain/middleware/custom` | ☐ |
@@ -159,7 +159,7 @@ Part II 的章节多一段：
 | I | 3 Model 层 | ☑ | | |
 | I | 4 Tool 层 | ☑ | | |
 | I | 5 State 与 Reducer | ☑ | 2026-10-22 | 3 |
-| I | 6 会话持久化 | ☐ | | |
+| I | 6 会话持久化 | ☑ | 2026-10-23 | 1 |
 | I | 7 结构化输出 | ☐ | | |
 | I | 8 Middleware 钩子地图 | ☐ | | |
 | I | 9 Middleware 实战 | ☐ | | |
@@ -186,9 +186,11 @@ Part II 的章节多一段：
 
 - 源码引用基于 `master` 分支的 `libs/langchain_v1`（v1 线）。你本地装的若是 v0.x，文件名与内部结构会不同（见第 0 章的版本判定法）。
 - **ch00–ch04 的"你应该看到"是按源码逻辑推导的**（写作时本机没有可用的执行通道）。**ch05 起改为实测**：第 5 章全部输出都是在本机 `langchain 1.4.6 / core 1.6.12 / langgraph 1.2.16` + `qwen3:latest@ollama` 上跑出来的；第 3 章的 callbacks 补充小节也已补实测（`langchain_learn/03_callbacks_demo.py`、`03_callback_params_trace.py`）。凡标"未实测"的地方，都明确写了是读源码推的。
+- **ch00–ch06 末尾各加了一节「附录 · 官方写法对照」**（锚点是 overview / agents / messages / models / tools / short-term-memory / checkpointers 七个官方页），对应代码 `langchain_learn/0X_official_*.py`。**这 7 节的输出全部是本机实测**，而且默认零 token：跑脚本只看编译期结构，加 `--real` 才发请求。附录里那些"我原本以为…实际上…"都是实测打脸记录，不是推演。
 - 模型名会漂移。凡是出现具体模型名的地方，一律以你 `.env` 的 `LLM_MODEL_ID` 为准。
 - **官方锚点会漂移。** `docs.langchain.com` 的页路径调整过多次（例如 `langchain-mcp-adapters` 已并入内置 `langchain.mcp`，middleware 从单页拆成 `/middleware/` 目录）。若某条路径 404，回到 `https://docs.langchain.com/llms.txt` 找新位置——那是官网自己给的机器可读索引，比站内搜索可靠。
 - **Part II 有几章本机可能跑不全**：MCP 的远程 server、部署、前端 streaming 都会碰到网络或需要额外服务。遇到环境阻塞不算你的问题，把该章降级为"读懂 + 画出调用链"。
+- **ch06 的"你应该看到"回到推导态**：写这一章时 `pwsh` 被 Windows 沙箱 ACL 拦住（`grantNamedSecurityInfoW failed (Win32 5)`），本机跑不了 Python，所以 `07-ch06-checkpoint-and-thread.md` 里的输出数字是**按源码推导的期望值**，不是实测。但源码事实是硬的——全部取自你 `.venv` 里已装的 `langgraph 1.2.16`（含行号），不是 GitHub master。你跑 `06_checkpointer.py` 时数字若不同，以你的为准。
 - **LangGraph 的深水区不在这里。** ch05/ch06/ch10 只到"会用"为止；图运行时、checkpointer 实现、子图作用域、时间旅行原理都在隔壁那本。
 
 ---

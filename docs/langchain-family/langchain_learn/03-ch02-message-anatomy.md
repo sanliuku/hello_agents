@@ -678,3 +678,114 @@ ToolMessage(
 下一章拆 Model 层，你会看到 `init_chat_model` 如何解析 `"provider:model"`，以及 `bind_tools` 究竟往 `additional_kwargs` 里塞了什么。
 
 ➡️ 第 3 章 · Model 层
+
+---
+
+## 附录 · 官方写法对照（messages 页）
+
+> 官方锚点：<https://docs.langchain.com/oss/python/langchain/messages>
+> 代码：`langchain_learn/02_official_messages.py`（A–E 段零 token，`--real` 才联网）
+
+正文是"切开一条消息看字段"，这一节走官方那条路：**同一件事，官方用哪几句话讲清楚**。官方页的六节刚好可以一比一映射成六个实验。
+
+| 官方小节 | 它要你记住什么 | 对应代码段 |
+|---|---|---|
+| Basic usage | 三种输入写法，最后都归一成消息对象 | A |
+| Message types | System / Human / AI / Tool 四类，各带什么字段 | B |
+| Message content | `content_blocks` 是标准化视图，不是替代品 | C |
+| Tool message → artifact | 有数据"给程序看、不给模型看" | D |
+| Serialization | `dumpd` / `load` | E |
+| Use with chat models | `usage_metadata`、chunk 相加 | F |
+
+### A2.1 三种输入写法，最后都归一
+
+实测：
+
+```text
+  ① 纯字符串     convert_to_messages -> ['HumanMessage']
+  ② 消息对象     convert_to_messages -> ['SystemMessage', 'HumanMessage']
+  ③ 字典格式     convert_to_messages -> ['SystemMessage', 'HumanMessage']
+```
+
+`role` 的映射表就是全部秘密：`system→SystemMessage`、`user→HumanMessage`、`assistant→AIMessage`、`tool→ToolMessage`。
+
+**但这里有个真坑**（正文没提，官方页也没提）：
+
+```text
+  陷阱：convert_to_messages('hi') -> 2 条消息！
+  它按字符遍历了。而 model.invoke('hi') 是合法的——包装发生在模型层，不是这里。
+  正确写法：convert_to_messages(['hi']) -> ['HumanMessage']
+```
+
+`convert_to_messages` 收的是**序列**，裸字符串会被当字符序列遍历。所以"`model.invoke("xx")` 能跑"不代表"`convert_to_messages("xx")` 能跑"——**字符串的包装发生在模型层，不在这层。**
+
+### A2.2 `content_blocks` 到底抹平了什么
+
+这是官方页最值钱的一段。它给了两个原生格式完全不同的例子：
+
+```python
+# Anthropic 风格：thinking + signature
+AIMessage(content=[{"type": "thinking", "thinking": "...", "signature": "WaUjzkyp"}, ...],
+          response_metadata={"model_provider": "anthropic"})
+
+# OpenAI 风格：reasoning + summary 数组
+AIMessage(content=[{"type": "reasoning", "id": "rs_abc123",
+                    "summary": [{"type": "summary_text", "text": "..."}, ...]}, ...],
+          response_metadata={"model_provider": "openai"})
+```
+
+实测的 `content_blocks`：
+
+```text
+  Anthropic: [{'type': 'reasoning', 'reasoning': '先把问题拆成两步', 'extras': {'signature': 'WaUjzkyp'}},
+              {'type': 'text', 'text': '答案是 42'}]
+
+  OpenAI   : [{'type': 'reasoning', 'id': 'rs_abc123', 'reasoning': '先算加法'},
+              {'type': 'reasoning', 'id': 'rs_abc123', 'reasoning': '再取整'},
+              {'type': 'text', 'text': '答案是 42', 'id': 'msg_abc123'}]
+```
+
+三条要点：
+
+1. 一个叫 `thinking`、一个叫 `reasoning`，抹平后**都是 `type='reasoning'`**。
+2. `content` 原封不动，`content_blocks` 只是**另一个视图**，不覆盖原数据。
+3. **块数会变**：OpenAI 那个的 `summary` 两条被展开成两个 reasoning 块（2 块 → 3 块）。所以别假设 `len(content) == len(content_blocks)`。
+
+### A2.3 `artifact`：给程序看，不给模型看
+
+```text
+  content  （进模型上下文）: It was the best of times, it was the worst of times.
+  artifact （不进模型）    : {'document_id': 'doc_123', 'page': 0, 'score': 0.93}
+```
+
+正文讲 `ToolMessage` 时只提了 `tool_call_id` 是硬约束。官方这里补了另一半：**消息里有一块专门留给"不污染上下文"的数据**。检索分数、原始 JSON、页码、调试信息全塞这里——第 16 章 agentic RAG 会反复用到它。
+
+### A2.4 序列化：能用，但会给你两条警告
+
+实测 `dumpd` 出来是 `{'lc': ..., 'type': 'constructor', 'id': [...], 'kwargs': {...}}`，`load` 能还原成 `HumanMessage`。但你会看到两条警告：
+
+```text
+LangChainBetaWarning: The function `load` is in beta.
+LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change...
+```
+
+这不是噪音，是信号：**`load` 默认允许反序列化任意对象，未来会收紧。** 官方那条安全警告要照着做——只 `load` 你自己写出去的数据；对不可信来源，显式传 `allowed_objects="messages"`。
+
+### A2.5 真跑一次：属性和 chunk 都是实打实的
+
+```text
+  F1 invoke 返回：
+    type           : AIMessage
+    text           : 消息是信息从发送者传递到接收者的过程或内容。
+    content_blocks : [{'type': 'text', 'text': '消息是信息从发送者传递到接收者的过程或内容。'}]
+    usage_metadata : {'input_tokens': 16, 'output_tokens': 386, 'total_tokens': 402, ...}
+    response_metadata 键: ['token_usage', 'model_provider', 'model_name',
+                           'system_fingerprint', 'id', 'finish_reason', 'logprobs']
+
+  F2 stream 拼接：
+    chunk 个数      : 231
+    拼回来的类型    : AIMessageChunk
+    拼回来的 text   : 1, 2, 3, 4, 5.
+```
+
+两个数字值得盯：`output_tokens=386` 而答案只有一句话——**多出来的是 qwen3 的思考 token**，`content_blocks` 里看不到它们。`231 个 chunk` 说明**流式块的大小完全由供应商决定**，别在 chunk 阶段渲染工具参数（正文⑦那条延伸的实测依据）。

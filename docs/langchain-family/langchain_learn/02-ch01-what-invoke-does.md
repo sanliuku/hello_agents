@@ -504,3 +504,83 @@ return [Send("tools", [tool_call]) for tool_call in pending_tool_calls]
 下一章拆开消息本体：一条 `AIMessage` 里到底装了什么，`tool_call_id` 为什么非存在不可（少了它整条链会断）。
 
 ➡️ 第 2 章 · Message 解剖（下一章）
+
+---
+
+## 附录 · 官方写法对照（agents 页）
+
+> 官方锚点：<https://docs.langchain.com/oss/python/langchain/agents>
+> 代码：`langchain_learn/01_official_create_agent.py`（B/C 段零 token，`--real` 才联网）
+
+正文是"把图拆开看源码"，这一节反过来：**官方那一页的目录，其实就是本章的大纲**。它列的 Core components 五项，正好对应教材后五章。
+
+### A1.1 官方页目录 vs 本教材章节
+
+| 官方页小节 | 讲的是 | 本教材 |
+|---|---|---|
+| Core components → Model | `model=` 收字符串或实例 | 第 3 章 |
+| Core components → Tools | `tools=` 收裸函数 / tool / dict | 第 4 章 |
+| Core components → System prompt | `system_prompt=` 收字符串或 `SystemMessage` | 第 2 章 |
+| Core components → Structured output | `response_format=` + `structured_response` | 第 7 章 |
+| Core components → Agent state | `AgentState` + `state_schema=` | 第 5 章 |
+| Configure the harness | middleware 的官方配料（retry / PII / HITL） | 第 8 / 9 章 |
+
+**这张表解决了一个很实际的问题**：官方页读着像"功能清单"，本教材读着像"源码注解"。两者是同一件事的两面，对着看才不迷路。
+
+### A1.2 五层配置，每加一层图怎么变（实测）
+
+```python
+# 每一行都是一次 create_agent(...)，编译期完成，一个 token 都不花
+report("① model + tools=[]",                create_agent(model=MODEL, tools=[]))
+report("② + tools=[get_weather]",           create_agent(model=MODEL, tools=[get_weather]))
+report("③ + system_prompt",                 create_agent(model=MODEL, tools=[get_weather], system_prompt="..."))
+report("④ + response_format=Answer",        create_agent(model=MODEL, tools=[get_weather], response_format=Answer))
+report("⑤ + state_schema=MyState",          create_agent(model=MODEL, tools=[get_weather], state_schema=MyState))
+```
+
+实测结果：
+
+| 配置 | 节点数 | 边数 | 新增的东西 |
+|---|---|---|---|
+| ① `tools=[]` | 3 | 2 | `__start__ → model → __end__`，**没有循环** |
+| ② `+tools` | 4 | 4 | 多出 `tools` 节点，和 `model` 互相成环 |
+| ③ `+system_prompt` | 4 | 4 | 与 ② **完全一致** |
+| ④ `+response_format` | 4 | 6 | 多 `model→model`（校验失败重试）与 `tools→__end__` |
+| ⑤ `+state_schema` | 4 | 4 | 与 ② 完全一致 |
+
+两条结论：
+
+1. **决定"有没有循环"的只有一个东西——`tools` 是不是空。** 其余参数再花哨也不改拓扑。
+2. **节点数不变 ≠ 图不变。** ④ 的节点数还是 4，边却从 4 条变成 6 条。看拓扑永远先看节点、再看边。
+
+### A1.3 官方 harness 配料对图的影响（实测，反直觉）
+
+| middleware | 节点变化 | 边变化 |
+|---|---|---|
+| `ModelRetryMiddleware(max_retries=3)` | 不变（4） | 多一条 `model→model` 自环 |
+| `PIIMiddleware("email")` | **+2 个节点**：`PIIMiddleware[email].before_model` / `.after_model` | 8 条，start 直接连到 before_model |
+| `HumanInTheLoopMiddleware(interrupt_on=...)` | **+1 个节点**：`HumanInTheLoopMiddleware.after_model` | 6 条，model 先到 HITL 再分叉 |
+
+这段是我预测错的地方，值得单独记：
+
+### 认知修正
+
+> 我原本以为 middleware 都是"包在节点内部"的 wrap 型钩子，所以图不会变；实际上 `ModelRetryMiddleware` 确实不改图（只加一条自环），但 `PIIMiddleware` 和 `HumanInTheLoopMiddleware` 会**真的长出新节点**——它们需要在 `model` 和 `tools` 之间插一脚，而 wrap 型钩子做不到"插一脚"这件事。
+
+这条区别就是第 8 章「钩子地图」的第一根主线：**节点型钩子（before_model / after_model）改图，wrap 型钩子（wrap_model_call / wrap_tool_call）只改调用。**
+
+### A1.4 真跑一次的实测输出
+
+```text
+[D] 真跑一次：官方 overview 结尾那行 print
+  消息条数：4
+    [0] HumanMessage
+    [1] AIMessage
+    [2] ToolMessage
+    [3] AIMessage
+
+  result['messages'][-1].content_blocks：
+    {'type': 'text', 'text': '杭州今天晴，气温26℃，天气晴朗宜人，适合外出活动。'}
+```
+
+`[1]` 里装的是 `tool_calls`，`[2]` 里装的是工具返回值，`[3]` 才是模型读完工具结果后的结论。**官方那句 `result["messages"][-1].content_blocks` 之所以只取最后一条，是因为前面三条都是过程。**

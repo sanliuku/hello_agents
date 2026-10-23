@@ -460,43 +460,38 @@ class S(TypedDict):
 
 **1. 为什么 `AgentState.messages` 的类型是 `list[AnyMessage]`，但两个节点分别返回一条消息后，state 里会变成两条？**
 
-<details><summary>答案</summary>
+**参考答案**（就在题目下面，不用点开）
 
 因为注解是 `Annotated[list[AnyMessage], add_messages]`。LangGraph 建图时读这层元数据，把这个字段的通道从 **LastValue** 换成 **BinaryOperatorAggregate(add_messages)**：每次写入都走 `add_messages(旧值, 新值)`，而它是"按 id 合并/追加"。没有这层 `Annotated`，就是 LastValue，后写覆盖先写。
 
-</details>
 
 **2. `state_schema=MyState` 时，`AgentState` 还参与吗？**
 
-<details><summary>答案</summary>
+**参考答案**（就在题目下面，不用点开）
 
 **不直接参与。** `base_state = state_schema if state_schema is not None else AgentState`——你传了，基线就是 `MyState`。`AgentState` 的字段能被你拿到，**只因为你继承了它**（注解继承）。所以"用裸 TypedDict"和"继承 AgentState"是两种完全不同的东西，前者会丢掉 `jump_to` / `structured_response` / `messages` 的 reducer。
 
-</details>
 
 **3. 哪三个字段会出现在 OutputSchema 里、但不在 InputSchema 里？为什么？**
 
-<details><summary>答案</summary>
+**参考答案**（就在题目下面，不用点开）
 
 `structured_response`（挂 `OmitFromInput`）、以及你自己用 `OmitFromInput` / `PrivateStateAttr` 标注的字段。`jump_to` 是两头都不进（`PrivateStateAttr`），不属于"只出"。规则来源是 `_resolve_schema(..., "output")` 剔掉 `OmitFromSchema(output=True)` 的字段，`"input"` 则剔 `input=True` 的。
 
-</details>
 
 **4. 想把一条已经写进 state 的消息**改掉内容**，怎么做？**
 
-<details><summary>答案</summary>
+**参考答案**（就在题目下面，不用点开）
 
 用**同一个 `id`** 再 append 一条新内容的消息。`add_messages` 遇到已有 id 是"原地替换"（B2 实测），不是追加。想删就用 `RemoveMessage(id=...)`；想全清就用 `RemoveMessage(id=REMOVE_ALL_MESSAGES)` 放在写入列表的第一位。
 
-</details>
 
 **5. reducer 的签名是什么？它能是 async 吗？**
 
-<details><summary>答案</summary>
+**参考答案**（就在题目下面，不用点开）
 
 `(left, right) -> new_value`，其中 `left` 是当前 channel 值、`right` 是本步写入值，返回值成为新 channel 值。**不能是 async**——它在图的状态更新阶段被同步调用；本机实测把 reducer 写成 `async def`，跑完 state 里那个字段直接变成一个 `<coroutine object>`（`type(...) == coroutine`），不报错。要异步做的事放到节点里做，节点只负责 `return` 结果。
 
-</details>
 
 ---
 
@@ -511,3 +506,214 @@ class S(TypedDict):
 去之前先带着这个问题：**`checkpointer` 存的是 state 快照，可 reducer 是"合并"语义——从快照恢复时，reducer 会被再执行一次吗？** 这个问题的答案决定了你能不能安全地在 reducer 里做副作用（比如发通知）。
 
 > 想先歇一下的话，也可以跳到第 11 章看测试——`InMemorySaver` 那一节会先把"state 怎么被存"讲一半。但顺序上，第 6 章更顺。
+
+---
+
+## 附录 · 官方写法对照（short-term-memory 页）
+
+> 官方锚点：<https://docs.langchain.com/oss/python/langchain/short-term-memory>
+> 代码：`langchain_learn/05_official_short_term_memory.py`（A–G 段全离线，假模型只数消息条数；`--real` 才真发请求）
+
+正文拆的是源码：`AgentState` 三个字段、`add_messages` 五步、`_resolve_schemas`、失忆铁证——回答"**reducer 为什么必须存在**"。这一节换成官方视角：官方页按"记忆存在哪 → 怎么加字段 → 怎么裁剪 → 怎么读写"四层组织，回答"**怎么用、边界在哪**"。
+
+两个文件都要看。因为官方页只讲用法，不讲"用错了为什么不报错"。
+
+| 官方小节 | 它解决什么问题 | 对应代码段 |
+|---|---|---|
+| Usage | 记忆存在哪、怎么打开 | A |
+| In production | 换 Postgres 要动什么 | A（只讲，本机无 pg 不跑） |
+| Customizing agent memory | 给 state 加自己的字段 | B |
+| Common patterns · Trim messages | 历史太长，丢老的 | C |
+| Common patterns · Delete messages | 精确删一条 / 全清 | D |
+| Common patterns · Summarize messages | 删不动了就压缩 | E |
+| Access memory · Tools | 工具里读 state、写 state | F |
+| Access memory · Prompt | 按 context 现算 system prompt | G |
+| Access memory · Before / After model | 钩子本身 | C / D（就是那两个装饰器） |
+
+### A5.1 三行代码，各自决定什么
+
+官方 Usage 一节的全部代码只有三行：`checkpointer=InMemorySaver()`、`thread_config = {"configurable": {"thread_id": "1"}}`、`invoke(..., thread_config)`。三行里藏着两件事：**checkpointer 决定"存不存"，thread_id 决定"存到哪个抽屉"**。
+
+实测三种写法，同一个问题问两遍：
+
+```text
+  ① checkpointer + 同一个 thread_id
+     两次模型看到的条数 = [1, 3]
+     快照里的 messages = 4 条（get_state 按 thread 取）
+
+  ② 同一个 saver，换了 thread_id
+     两次模型看到的条数 = [1, 1]
+
+  ③ 没有 checkpointer
+     两次模型看到的条数 = [1, 1]
+```
+
+`[1, 3]` vs `[1, 1]` 就是这一节的全部。三个排查顺序也因此固定下来：
+
+1. **没有 checkpointer** → 每次 `invoke` 都是全新 state，上一轮的东西**没地方可存**；
+2. **有 checkpointer 但 thread_id 变了** → 存下来了，只是存进了另一个抽屉。②③ 的结果一样，病因完全不同；
+3. 两样都对还"记不住" → 才轮到怀疑 reducer（正文 2.5）和 prompt。
+
+两个容易漏的细节：
+
+- 第二轮只传**新消息**，旧消息由 checkpointer 恢复后走 `add_messages` 合并。所以"每轮把全量历史塞回去"是多余动作，而且会**重复追加**。
+- `InMemorySaver` 进程一退就没。生产换 `PostgresSaver`，那节的 `with ... as checkpointer` + `checkpointer.setup()` 是**自动建表**，不是连接池——这两句漏了，线上第一晚就会报 `relation does not exist`。
+
+### A5.2 `state_schema`：官方说 extend，实际是 replace
+
+```text
+  第一轮传了 user_id，state 的 key = ['messages', 'user_id']
+  第二轮**只传 messages**，user_id 仍 = 'u_42'
+
+  自定义 state 的 input  schema = ['messages', 'user_id', 'plan']
+  自定义 state 的 output schema = ['messages', 'structured_response', 'user_id', 'plan']
+  默认 AgentState 的 output   = ['messages', 'structured_response']
+  裸 TypedDict 的 output      = ['messages', 'user_id']
+```
+
+两件事：
+
+- **自定义字段和 `messages` 一样会被 checkpointer 存下来。** 第二轮不传 `user_id`，它还在。这就是"会话级配置"最省事的落地方式，不必每轮从 token 里解一遍。
+- **继承与裸写的差别，只在 output schema 那一行。** 裸 `TypedDict` 少了 `structured_response`——第 7 章的结构化输出会**直接失效**，而报错信息不会指向 `state_schema`。
+
+所以官方原话的 "extend the agent's state"，落到代码上是 `class MyState(AgentState[Any])`，**不是**裸 `TypedDict`。`factory.py` 里那句 `base_state = state_schema if state_schema is not None else AgentState` 才是真相：传了就是替换，你的类里没写的字段，图上就不存在。
+
+### A5.3 Trim：只留第一条 + 最近几条
+
+```text
+  turn0  模型看到 1 条  |  state 2 条
+  turn1  模型看到 3 条  |  state 4 条
+  turn2  模型看到 5 条  |  state 6 条
+  turn3  模型看到 5 条  |  state 6 条
+```
+
+从 turn3 起进入稳态：**模型永远看到 5 条，state 永远 6 条**。
+
+- turn0/turn1 没越过 3 条，`return None`，什么都不做；
+- turn2 是"5 进 5 出"，剪了但没剪掉东西，state 已涨到 6；
+- 第一条**永远留着**——官方这个例子的意图就是"开场设定不能丢"。
+
+为什么用哨兵而不是逐条 `RemoveMessage`：
+
+- 逐条要自己算 id 列表，还容易删出"AI 带 tool_calls、对应 ToolMessage 却被删"的**非法历史**；
+- `[RemoveMessage(id=REMOVE_ALL_MESSAGES), *保留的]` 是一次原子替换，你给什么就是什么。
+
+> **一个官方例子没说的副作用**（看 turn3 那行）：留下来的 `AI:答2` 是回答"第1轮"的，可"第1轮"那半句已经被切掉了。按**条数**切就会切出"没有问题的答案"。它不违反消息格式（仍是 H/A 交替），但模型看到的是一段没头没尾的历史。要严谨就按**问答对**切，或者切完断言首条是 `HumanMessage`。
+
+还有一个边界：`before_model` 改的是**本次调用看到的上下文**，不是持久化的历史。想要"历史真的变短"，得用下一段的 `after_model` + 删除。
+
+### A5.4 Delete：`RemoveMessage` 删一条 / 全清
+
+```text
+  turn0  state 2 条  第0轮 | 答1
+  turn1  state 2 条  第1轮 | 答2
+  turn2  state 2 条  第2轮 | 答3
+```
+
+`after_model` 里删的是**真历史**：state 稳定在 2 条，第 0 轮被彻底抹掉。所以官方那个例子里问 "what's my name?" 得到 "I don't know your name"——**不是模型笨，是那句话真的不在 state 里了**。这跟 A5.3（只裁上下文、历史还在）是两件事，也是选型时最该分清的一处。
+
+全清就是只返回一个哨兵：
+
+```python
+return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)]}
+```
+
+实测跑完 `state["messages"]` 是 `[]`——**连这一轮的回复也没了**。`REMOVE_ALL_MESSAGES` 的语义不是"删某条"，是"从这里重新开始"。
+
+三条边界（官方特意写了一段注意事项）：
+
+- 删**不存在**的 id → `ValueError`，不是静默忽略（正文 B4 已实测）；
+- 删完要保证历史**合法**：某些 provider 要求首条是 `user`；AI 带 `tool_calls` 时，对应的 `ToolMessage` 不能单独删掉，否则下一次请求直接被拒；
+- 想**改内容**而不是删：用同一个 `id` 再写一遍，`add_messages` 会原地替换（正文 B2）。
+
+### A5.5 Summarize：删不动了就压缩
+
+官方给的是**一行配置**，本机把 `trigger` 从 `("tokens", 4000)` / `("messages", 20)` 调小，才能在四轮里看到它触发：
+
+```python
+SummarizationMiddleware(model=summarizer, trigger=("messages", 5), keep=("messages", 2))
+```
+
+实测四轮下来：
+
+```text
+  摘要模型被调用了 2 次（不是每轮都调）
+  最终 state 4 条：
+    HumanMessage   Here is a summary of the conversation to date:  （摘要）用户叫 Bob，一直在问天气。
+    AIMessage      答3：见到3条
+    HumanMessage   我叫 Bob，第3轮
+    AIMessage      答4：见到3条
+```
+
+三个参数先分清：
+
+| 参数 | 含义 | 常见取值 |
+|---|---|---|
+| `trigger` | 什么时候摘要 | `("messages", 20)` 数条数 / `("tokens", 4000)` 估 token / `("fraction", 0.8)` 按窗口比例 |
+| `keep` | 摘要时保留多少原文 | `("messages", 20)` / `("tokens", 3000)` |
+| `model` | **用哪个模型写摘要** | 官方示例特意用小模型（`gpt-5.4-mini`），这是纯体力活 |
+
+摘要和裁剪怎么选：
+
+- trim/delete 是**丢**，丢掉的再也回不来；摘要多花一次模型调用，换"细节压缩成结论"；
+- 结论性信息（我叫什么、定了什么方案）用摘要；过程性噪音（工具回了一大坨 JSON）直接删；
+- 摘要会**改写历史**：那条摘要以 `HumanMessage` 形式（`Here is a summary of the conversation to date: ...`）排在开头，之后模型看到的就是"摘要 + 最近几条"。所以别指望模型还能引用摘要里的原始措辞。
+
+### A5.6 Access memory · Tools：`runtime.state` 读，`Command` 写
+
+```text
+  两个工具的 schema 参数 = [[], ['plan']]
+
+  [0] HumanMessage  我在什么套餐？帮我升到 pro
+  [1] AIMessage      ← 只有 tool_calls，content 是空的：['get_user_info']
+  [2] ToolMessage   user_id=u_42, plan=free tool_call_id=call_read
+  [3] AIMessage      ← 只有 tool_calls，content 是空的：['set_plan']
+  [4] ToolMessage   套餐已改为 pro tool_call_id=call_write
+  [5] AIMessage     已办好。
+
+  最终 state['plan'] = 'pro'
+```
+
+- `get_user_info` **一个业务参数都没有**，`runtime` 是保留名，不进 schema——模型看不见、也填不了（第 4 章 C 段同一条）。
+- 写 state 只能 `return Command(update={...})`，且 `update` 里**必须**带 `ToolMessage`、`tool_call_id=runtime.tool_call_id`。忘了带 → `ToolNode` 直接 `ValueError`，**是框架报错，不是模型报错**。
+- 注意 `[2]` 里还是 `plan=free`：读在前、写在后，工具看到的是**执行那一刻**的 state。同一轮里两个工具改同一个字段，谁后跑谁赢——它们不是事务，别指望顺序无关。
+- 只想给模型看一段话就 `return` 字符串 / dict，那**不会**改 state。
+
+### A5.7 Access memory · Prompt：`@dynamic_prompt` + `ModelRequest`
+
+```text
+  模型收到的第一条 = SystemMessage
+  内容 = 'You are a helpful assistant. Address the user as 张三.'
+```
+
+三个概念在这一节最容易糊，划清：
+
+| | 是什么 | 谁写 | 会不会被持久化 |
+|---|---|---|---|
+| `state` | 会涨、会被 checkpointer 存下来的东西 | 节点 / 工具 / 中间件 | 会 |
+| `context` | 每次 `invoke` 传一次的不可变配置（用户身份、租户、权限） | 调用方 | 不会，也不该进 `messages` |
+| `prompt` | 由前两者**现算**出来的字符串 | `@dynamic_prompt` | 只在本次调用有效 |
+
+所以"按用户改称呼"该用 `context_schema` + `@dynamic_prompt`，而不是把 `user_name` 拼进 `messages`——拼进去就成了历史，历史会被裁剪、会被摘要、会被下一轮重复追加。
+
+### A5.8 真跑一次：同一 thread 两轮
+
+```text
+  第 1 轮：我叫小林，在做 LangChain 教材。
+    AI: 小林，你的LangChain教材一定会成为社区的宝贵资源！…
+
+  第 2 轮（只传新消息）：我叫什么？
+    AI: 小林。
+
+  state 里 messages = 4 条，user_id = 'u_lin'
+    [0] HumanMessage  我叫小林，在做 LangChain 教材。一句话回我。
+    [1] AIMessage     小林，你的LangChain教材一定会成为社区的宝贵资源！…
+    [2] HumanMessage  我叫什么？一句话。
+    [3] AIMessage     小林。
+```
+
+第二轮只传了一条消息，模型却答得出"小林"——靠的就是 A5.1 那个 checkpointer + 同一个 `thread_id`。把 `thread_id` 换成 `real-2` 再问一次，它就不认识了。**这是验证"记忆到底通没通"最省事的一招，比看日志快。**
+
+### 认知修正
+
+> 我原本以为 "short-term memory" 是一个功能（开了就有记忆）；实际上它是**四件互不相关的事**拼起来的：`checkpointer` 负责存、`thread_id` 负责分抽屉、reducer 负责合并、trim/summarize 负责不让它涨爆。**少任何一件，表现都是"它记不住"，但病因完全不同。** 所以排查顺序必须是：先看 checkpointer 与 thread_id（A5.1），再看 state 有没有继承 `AgentState`（A5.2），最后才看 reducer 和裁剪逻辑。

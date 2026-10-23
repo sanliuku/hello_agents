@@ -1018,3 +1018,128 @@ LangChain 的做法是顺着这个约束走：**把所有 properties 变成 requ
 `create_agent(checkpointer=...)` 里的那个 checkpointer，和 `AgentState` 里的 `messages` 字段，是两套不同的机制：前者存"图执行到哪了"，后者定义"状态长什么样、新消息怎么并进去"。
 
 下一章拆 `State` 与 `Reducer`：你会看到 `add_messages` 为什么不是普通 list 拼接，以及**为什么两个并行节点同时往 `messages` 写不会互相覆盖**。
+
+---
+
+## 附录 · 官方写法对照（models 页）
+
+> 官方锚点：<https://docs.langchain.com/oss/python/langchain/models>
+> 代码：`langchain_learn/03_official_models.py`（A–E 段零 token，`--real` 才联网）
+
+正文是"顺着 `init_chat_model` 的源码往下读"，这一节换成官方视角：**用户该知道的那五件事**。两边对照，你会发现正文里那些自研打印，恰好补上了官方页没说透的部分。
+
+### A3.1 取模型的两条路，其实是同一个类
+
+```text
+  init_chat_model(...)  -> langchain_openai.chat_models.base.ChatOpenAI
+  ChatOpenAI(...)       -> langchain_openai.chat_models.base.ChatOpenAI
+```
+
+`init_chat_model` 就是个**分发表**：`provider` 决定 import 哪个包、实例化哪个类。什么时候必须用第二条路？**要传 provider 独有参数时**（比如 OpenAI 的 `use_responses_api`）。
+
+装错包的对应关系（这是新手最常见的 30 分钟）：
+
+| provider | 要装的包 | extra |
+|---|---|---|
+| `openai` | `langchain-openai` | `langchain[openai]` |
+| `anthropic` | `langchain-anthropic` | `langchain[anthropic]` |
+| `google_genai` | `langchain-google-genai` | `langchain[google-genai]` |
+| `bedrock_converse` | `langchain-aws` | `langchain[aws]` |
+
+### A3.2 参数全部落在构造期
+
+实测把本机实例的属性读出来：
+
+```text
+    model_name         = 'qwen3:latest'
+    temperature        = 0.0
+    max_tokens         = None
+    request_timeout    = 60.0
+    max_retries        = None
+```
+
+官方表里六个参数（`model` / `api_key` / `temperature` / `max_tokens` / `timeout` / `max_retries`）**都是构造期就固定的**，不是每次 invoke 再传。这条认知很重要：**想"这次用 0、下次用 1"改 temperature，得换实例，不是在消息里加参数。**
+
+### A3.3 重试边界：`is_retryable` 是写死的，不用你猜
+
+官方页说"自动重试网络错误、429、5xx，不重试 401/404"。本机实测把这张表打全了：
+
+| 异常 | `is_retryable` |
+|---|---|
+| `ModelConnectionError` | ✅ True |
+| `ModelRateLimitError`（429） | ✅ True |
+| `ModelTimeoutError` | ✅ True |
+| `ModelAPIError`（5xx 父类） | ✅ True |
+| `ModelAuthenticationError`（401） | ❌ False |
+| `ModelNotFoundError`（404） | ❌ False |
+| `ModelInvalidRequestError` | ❌ False |
+| `ModelPermissionDeniedError` | ❌ False |
+| `ContextOverflowError` | ❌ False |
+
+**最后一行是个提醒**：上下文超了不会因为重试而变短。它的处理方式是摘要或截断（第 12 章），不是 retry。
+
+### A3.4 `bind_tools` 之后请求里多了什么
+
+```text
+  kwargs['tools'] 条数：1
+    name        : get_weather
+    description : Get the weather at a location.
+    parameters  : {'properties': {'location': {'type': 'string'}},
+                   'required': ['location'], 'type': 'object'}
+```
+
+`bind_tools` **只把 schema 塞进请求，不执行任何东西**。所以官方紧接着给了一段"手动工具循环"：
+
+```python
+messages = [{"role": "user", "content": "..."}]
+ai_msg = model_with_tools.invoke(messages)
+messages.append(ai_msg)
+for tool_call in ai_msg.tool_calls:
+    result = tools_by_name[tool_call["name"]].invoke(tool_call)
+    messages.append(result)
+final = model_with_tools.invoke(messages)
+```
+
+**这 6 行就是 `create_agent` 内部 `tools` 节点的全部内容。** 正文第 1 章那张图里的循环，剥掉 LangGraph 的调度外壳，剩下的就是这个。
+
+### A3.5 结构化输出：3 种 schema × 3 种 method，共用同一个出口
+
+```text
+  ① Pydantic
+     with_structured_output(Movie) -> RunnableSequence
+     必填字段：['title', 'year', 'director', 'rating']
+
+  ② TypedDict / ③ JSON Schema
+     method=function_calling   构造成功
+     method=json_schema        构造成功
+     method=json_mode          构造成功
+```
+
+`method` 三选一的真实含义：
+
+| method | 怎么实现 | 代价 |
+|---|---|---|
+| `function_calling` | 借工具的通道传 schema，兼容性最好 | 多一份 tool schema，token 更贵 |
+| `json_schema` | 用 provider 原生结构化输出 | 不是所有 provider 都支持 |
+| `json_mode` | 只保证输出是合法 JSON，schema 要自己写进 prompt | 约束最弱 |
+
+**和 `create_agent(response_format=...)` 的区别**（这条最容易被混）：
+
+- `with_structured_output` 是**模型级**约束：一次调用就定型。
+- `response_format` 是 **agent 级**约束：多轮工具调用跑完之后再定型，结果在 `result["structured_response"]`。
+
+### A3.6 真跑一次
+
+```text
+  invoke  -> AIMessage / 温度是物体内部粒子运动剧烈程度的度量，用来表示物体的冷热程度。
+  usage   -> {'input_tokens': 16, 'output_tokens': 414, 'total_tokens': 430, ...}
+
+  stream  -> 209 个 AIMessageChunk
+  拼接后  -> 一、二、三！（*鼓掌*）需要我接着做点什么吗？
+```
+
+注意 `invoke` 用时远大于 `stream` 首块出现的时间——**这就是所有前端都改成流式的原因**，跟模型快慢无关，跟"用户先看到字"有关。
+
+### 认知修正
+
+> 我原本以为 `max_retries` 只是"多试几次"的粗暴开关；实际上框架**已经按异常类型分好了**可重试与不可重试两类，`is_retryable` 是写死的属性。你真正该调的不是 retry 次数，而是"遇到不可重试的异常时降级到哪个模型"（第 19 章 `ModelFallbackMiddleware`）。

@@ -316,3 +316,102 @@ tool_calls : [{'name': 'ping', 'args': {'text': 'hello'}, 'id': 'call_...', 'typ
 环境里已经有了 `create_agent`。下一章我们干一件很"暴力"的事：**让它把内部那张图打印出来给你看**——你会亲眼看到"Agent 循环"是一条 `model → tools → model` 的回路，而不是什么魔法。
 
 ➡️ [第 1 章 · 一次 invoke 的真相](02-ch01-what-invoke-does.md)
+
+---
+
+## 附录 · 官方写法对照（overview 页）
+
+> 正文是"顺着源码往下钻"。这一节反着来：**先把官方页面的最小写法抄一遍，再回头和我们钻的东西对表。**
+> 官方锚点：<https://docs.langchain.com/oss/python/langchain/overview>
+> 代码：`langchain_learn/00_official_agent_equation.py`（A–D 段零 token，`--real` 才联网）
+
+### A0.1 官方那句话，就是全书的地基
+
+> **Agent = Model + Harness.** LangChain provides `create_agent`: a minimal, highly configurable harness. The harness is everything around the model loop: the prompt, the tools, and any middleware that shapes behavior.
+
+拆开看只有两个词：
+
+| 词 | 指什么 | 教材里谁在讲 |
+|---|---|---|
+| **Model** | 那个会说话的东西，负责"下一步做什么" | 第 3 章 |
+| **Harness** | 套在它外面的循环：prompt、tools、middleware | 第 1 / 4 / 8 章 |
+
+所以后面所有章节，本质上都在回答一个问题：**这个 harness 的每一颗螺丝钉拧在哪。**
+
+### A0.2 官方最小例（原样，6 行）
+
+```python
+from langchain.agents import create_agent
+
+def get_weather(city: str) -> str:
+    """Get weather for a given city."""
+    return f"It's always sunny in {city}!"
+
+agent = create_agent(
+    model="openai:gpt-5.5",
+    tools=[get_weather],
+    system_prompt="You are a helpful assistant",
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "What's the weather in San Francisco?"}]}
+)
+print(result["messages"][-1].content_blocks)
+```
+
+三处值得停一下：
+
+1. `model` 收**字符串**，不是对象。字符串晚绑定，所以配 `.env` 才不会把密钥写进代码。
+2. `tools` 收**裸函数**，连 `@tool` 都不用加。官方在 agents 页说得很直白："pass any Python callable, LangChain tool, or tool dict"。
+3. 返回值是 `dict`，答案在 `messages[-1].content_blocks`，不是 `content`。
+
+### A0.3 `"provider:model"` 到底怎么拆
+
+实测输出（`python langchain_learn/00_official_agent_equation.py`）：
+
+```text
+  openai:gpt-5.5                     -> provider=openai         model=gpt-5.5
+  google_genai:gemini-3.6-flash      -> provider=google_genai   model=gemini-3.6-flash
+  anthropic:claude-sonnet-4-5        -> provider=anthropic      model=claude-sonnet-4-5
+  ollama:qwen3:latest                -> provider=ollama         model=qwen3:latest
+```
+
+**最后一行是个真坑**：ollama 的模型名自己带冒号（`qwen3:latest`，冒号后面是 tag）。所以必须 `partition(":")` 或 `split(":", 1)`；用 `split(":")` 会把它切成三段，然后你就得到一个叫 `qwen3` 的不存在的模型。
+
+顺带解释本机 `.env` 的写法：我们不走 `ollama` provider（那要装 `langchain-ollama`，本机实测**未装**），而是走 ollama 暴露的 **OpenAI 兼容口** `http://localhost:11434/v1`，所以 provider 填 `openai`，模型名填 `qwen3:latest`。
+
+### A0.4 `create_agent` 的 15 个参数，只有 4 个是 harness
+
+实测打印（本机 `langchain 1.4.6`）：
+
+| 堆 | 参数 | 决定什么 |
+|---|---|---|
+| **harness 层**（4 个） | `model` / `tools` / `system_prompt` / `middleware` | agent 怎么想、能做什么 |
+| **运行时层**（11 个） | `response_format` / `state_schema` / `context_schema` / `checkpointer` / `store` / `interrupt_before` / `interrupt_after` / `debug` / `name` / `cache` / `transformers` | 这次跑起来怎么存、怎么停、怎么换模型 |
+
+这张表能省你很多时间：**遇到"怎么让 agent 记住上一轮"这种问题，答案永远在运行时层，不在 harness 层。**
+
+### A0.5 三个框架的判据（别背定义，背"什么时候选它"）
+
+| 框架 | 什么时候选它 | 本机状态 |
+|---|---|---|
+| **Deep Agents** | 要开箱即用：上下文压缩、虚拟文件系统、子 agent 都已装好 | 已装 |
+| **LangChain** | 要自己配 harness，逐项拧 | 本教材主战场 |
+| **LangGraph** | 要确定性流程和 agent 混编、要自己控状态机 | 已装（隔壁那本） |
+| **LangSmith** | 不管用哪个框架，都要 trace / 调试 / 评测 | 上线前必备 |
+
+### A0.6 真跑一次的实测输出
+
+```text
+[E] 真跑一次：把官方例子的 model 换成本机模型
+  消息条数：4（含 Human / AI / Tool）
+  最后一条类型：AIMessage
+  content_blocks（官方 overview 最后那行 print）：
+    {'type': 'text', 'text': '杭州今天天气晴朗，阳光明媚，非常适合外出活动！'}
+```
+
+`4 条消息` 这个数字要记住：`Human → AI(带 tool_calls) → Tool → AI`。**官方那 6 行代码背后已经跑了一整圈循环**，只是你没看见。
+
+### 认知修正
+
+> 我原本以为 `create_agent` 那十几个参数都是"配置 agent 能力的"；实际上只有 `model / tools / system_prompt / middleware` 四个属于 harness，其余十一个是**运行时**——它们不改 agent 的性格，只改这一次执行怎么落地。

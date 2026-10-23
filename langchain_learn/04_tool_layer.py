@@ -162,10 +162,14 @@ def fail_value(x: int) -> str:
     raise ValueError(f"内部错误：x={x}")
 
 
-@tool(handle_tool_error="工具暂时不可用，请稍后重试")
+@tool
 def fail_handled() -> str:
     """已配错误处理。"""
     raise ToolException("真实原因：DB 连接池耗尽（不该给模型看）")
+
+
+# langchain_core 1.x 的 @tool 已不接受 handle_tool_error，只能在实例上设置
+fail_handled.handle_tool_error = "工具暂时不可用，请稍后重试"
 
 
 for _name, _t, _inp in [

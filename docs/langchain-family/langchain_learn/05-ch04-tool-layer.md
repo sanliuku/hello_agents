@@ -752,10 +752,14 @@ def fail_value(x: int) -> str:
     raise ValueError(f"内部错误：x={x}")
 
 
-@tool(handle_tool_error="工具暂时不可用，请稍后重试")
+@tool
 def fail_handled() -> str:
     """已配错误处理。"""
     raise ToolException("真实原因：DB 连接池耗尽（不该给模型看）")
+
+
+# langchain_core 1.x 的 @tool 已不接受 handle_tool_error，只能在实例上设置
+fail_handled.handle_tool_error = "工具暂时不可用，请稍后重试"
 
 
 for name, t, inp in [
@@ -1067,3 +1071,153 @@ print(type(msg.content), repr(msg.content))
 **下一章（第 3 章 Model 层）就拆这个**：`init_chat_model` 如何解析 `"openai:gpt-4o"`、`bind_tools` 往 `RunnableBinding` 里塞了什么、以及"工具 schema 里的 description 到底从哪个字段读"。
 
 > 想先歇一下的话，另一条合理路线是跳到**第 5 章 State 与 Reducer**——从"单个工具"上升到"工具之间共享的状态"。两条路都能接上，选你现在更想解决的那个问题。
+
+---
+
+## 附录 · 官方写法对照（tools 页）
+
+> 官方锚点：<https://docs.langchain.com/oss/python/langchain/tools>
+> 代码：`langchain_learn/04_official_tools.py`（A–F 段全部离线，连工具都是手工 invoke；`--real` 才让 agent 真调）
+
+正文是"一个函数怎么变成 schema、又怎么被执行"，这一节换成官方视角：**官方页按"定义 → 拿上下文 → 执行 → 兜错"四层组织，比源码顺序更接近你写代码的顺序。**
+
+| 官方小节 | 它解决什么问题 | 对应代码段 |
+|---|---|---|
+| Create tools | `@tool` + docstring 就够了吗 | A |
+| Advanced schema | 类型提示撑不住时怎么办 | B |
+| Reserved argument names | `runtime` / `config` 为什么填不了 | C |
+| Access context | `ToolRuntime` 里到底有什么 | C |
+| Tool execution | 返回值有几种、`return_direct` 何时真短路 | D / E |
+| Error handling | 异常怎么翻译成模型看得懂的话 | F |
+
+### A4.1 `@tool` 三件套：docstring 就是 description
+
+实测三个定义：
+
+```text
+  name        : search_database
+  description : Search the customer database for records matching the query.      Args…
+  schema 参数 : ['query', 'limit']
+
+  name        : web_search                    # @tool("web_search") 改名
+  description : Search the web for information.
+  schema 参数 : ['query']
+
+  name        : calculator                    # @tool("calculator", description=...) 改描述
+  description : Performs arithmetic calculations. Use this for any math problems.
+  schema 参数 : ['expression']
+```
+
+三件事：
+
+1. **docstring 就是 description**，也是模型判断"该不该调它"的唯一依据。写不好 = 工具等于不存在。
+2. `@tool("名字")` 覆盖函数名；再传 `description=` 覆盖描述。
+3. 带默认值的参数（`limit: int = 10`）**不进 `required`**。
+
+> 命名规范官方也点了：推荐 `snake_case`，只用字母数字下划线连字符。有些 provider 会直接拒绝带空格或特殊字符的工具名。
+
+### A4.2 `args_schema`：把"给参数的说明"变成 schema
+
+```text
+    location           string   默认=None
+    units              string   默认='celsius' / 枚举=['celsius', 'fahrenheit']
+    include_forecast   boolean  默认=False
+
+  必填：['location']
+```
+
+`Literal["celsius","fahrenheit"]` 变成了 `enum`——**模型只能在合法值里选，省掉一轮纠错**。这是正文里"三份 schema"那套机制最直接的收益：你写的每一句 `Field(description=...)`，最后都会变成 prompt 的一部分。
+
+### A4.3 `runtime` 是保留名：模型看不见，也填不了
+
+```text
+  noisy_report 的 schema 参数  : ['topic']
+  get_last_user_message 的 schema: []
+```
+
+第二个工具**一个业务参数都没有**，但它合法——`runtime` 由框架注入。这就是官方那句 "Runtime is invisible to the model" 的字面含义。
+
+`ToolRuntime` 的八个部件（本机实测）：
+
+| 部件 | 用途 | 怎么取 |
+|---|---|---|
+| `state` | 短期记忆：messages + 自定义字段 | `runtime.state["messages"]` |
+| `context` | 每次运行的不可变配置 | `runtime.context.user_id` |
+| `store` | 长期记忆，跨会话 | `runtime.store.get(...)` |
+| `stream_writer` | 工具执行中发进度 | `runtime.stream_writer("...")` |
+| `execution_info` | thread_id / run_id / 重试次数 | `runtime.execution_info.thread_id` |
+| `server_info` | LangGraph Server 元数据（本地为 `None`） | `runtime.server_info` |
+| `config` | `RunnableConfig`：回调、标签 | `runtime.config` |
+| `tool_call_id` | 本次调用的唯一 ID | `runtime.tool_call_id` |
+
+> 官方已把 `InjectedState` / `InjectedStore` / `InjectedToolCallId` 标成待迁移。**新代码一律用 `ToolRuntime`**，一个参数拿全部。
+
+### A4.4 四种返回值，`content` 的类型不一样
+
+这里有个容易踩的坑：`tool.invoke({"city": "杭州"})` 返回的是**原始返回值**；要拿到框架真正塞进 `messages` 的 `ToolMessage`，得传一个 `ToolCall`（`{"name","args","id","type"}`）。官方"手动工具循环"里写 `tool.invoke(tool_call)`，原因就在这。
+
+实测：
+
+```text
+  str        -> ToolMessage.content 类型 = str
+               content = It is currently sunny in 杭州.
+
+  dict       -> ToolMessage.content 类型 = str
+               content = {"city": "杭州", "temperature_c": 22, "conditions": "sunny"}
+
+  list[dict] -> ToolMessage.content 类型 = list
+               content = [{'type': 'text', ...}, {'type': 'image', ...}]
+```
+
+`dict` 被**序列化成 JSON 字符串**（所以模型看到的是文本，不是对象）；多模态返回的 `content` 才是块列表，要走 `content_blocks` 读。
+
+第五种返回值是 `Command`（工具自己改 state），官方给了两条硬约束：
+
+- `update` 里**必须**带 `ToolMessage`，且 `tool_call_id=runtime.tool_call_id`；
+- 忘了带 → `ToolNode` 直接 `ValueError`。**这是框架报错，不是模型报错**，别去翻 prompt。
+
+### A4.5 `return_direct` 的三条边界
+
+官方写得很细，值得抄下来（很多人以为"标了就短路"）：
+
+1. 一批并行调用里，**每一个**工具都 `return_direct=True` 才路由到 `END`；
+2. 只要有一个不是，就带着全部 `ToolMessage` 回到模型；
+3. 和 `Command` 组合时，`ToolMessage` 仍要自己补，`Command` 不会自动转。
+
+### A4.6 兜错该写在 middleware，不是写在工具里
+
+```python
+@wrap_tool_call
+def handle_tool_errors(request, handler):
+    try:
+        return handler(request)
+    except Exception as error:
+        return ToolMessage(
+            content=f"Tool error: Please check your input and try again. ({error})",
+            tool_call_id=request.tool_call["id"],
+        )
+```
+
+| 兜在哪 | 模型收到什么 | 问题 |
+|---|---|---|
+| 工具内部 `try/except` | 一段"出错了"文本 | 格式不统一，要写 N 遍 |
+| middleware `@wrap_tool_call` | 统一的 `ToolMessage`，带 `tool_call_id` | 一次写完全局生效 |
+
+工具自己 `raise ToolException` 也是合法的——那是"我想让模型知道"的语义，和"我不想让程序崩"是两件事。
+
+### A4.7 真跑一次：`tool_call_id` 一一对应
+
+```text
+    [0] HumanMessage
+    [1] AIMessage
+          tool_call id=call_8kpy8wmm name=get_weather args={'location': '杭州', 'units': 'celsius'}
+    [2] ToolMessage
+          tool_call_id=call_8kpy8wmm content=Current weather in 杭州: 22 degrees C
+    [3] AIMessage
+```
+
+注意 `[1]` 里的 `args`：**`units='celsius'` 是模型自己按 `args_schema` 的默认值补上的**。这就是 A4.2 那张 schema 的直接效果——你写的 schema 有多细，模型填的参数就有多准。
+
+### 认知修正
+
+> 我原本以为工具"返回什么模型就看到什么"；实际上 `str` / `dict` / 多模态在进上下文前会被**分别处理**：`dict` 变成 JSON 字符串、多模态变成块列表、`artifact` 一个字节都不进模型。**"返回值"和"模型看到的东西"不是一回事，中间隔着一层序列化。**
